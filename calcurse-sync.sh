@@ -1130,6 +1130,21 @@ option_F() {
     echo "📖 CONSULTA IL REPORT:"
     echo "   - Leggi $sync_report per le istruzioni dettagliate"
     echo "   - Il report viene sovrascritto ad ogni esecuzione"
+    echo ""
+    # Chiedi all'utente se vuole aprire il report con Vim
+    read -rp "📝 Vuoi aprire adesso il report con Vim? (s/N): " open_report
+    if [[ "$open_report" =~ ^[sSyY]$ ]]; then
+        if command -v vim >/dev/null 2>&1; then
+            vim "$sync_report"
+        else
+            echo "⚠️  Vim non trovato. Apri manualmente: $sync_report"
+            echo "   Puoi usare: less '$sync_report' o cat '$sync_report'"
+        fi
+    else
+        echo "📖 Per consultare il report in seguito:"
+        echo "   vim '$sync_report'"
+        
+    fi
 }
 
 # ----------------------------------------------------------------------
