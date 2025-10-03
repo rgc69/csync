@@ -1,4 +1,6 @@
-# 🔄 Proton Calendar ↔ Calcurse Sync Tool
+# csync
+
+🔄 Proton Calendar ↔ Calcurse Sync Tool
 
 A bash script that manually synchronizes events between **Proton Calendar** and **Calcurse**, bridging the gap between modern cloud calendars and efficient terminal-based scheduling.
 
