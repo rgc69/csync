@@ -748,7 +748,7 @@ option_A() {
                 local key1="${dtstart}|${summary}"  # Data + Titolo
                 calcurse_events["$key1"]=1
             fi
-            
+
             if [[ -n "$summary" ]]; then
                 local key2="${summary}"             # Solo titolo (per eventi ricorrenti)
                 calcurse_events["$key2"]=1
@@ -785,11 +785,11 @@ option_A() {
             # Crea le stesse chiavi usate per Calcurse - CORREZIONE: controlla che le chiavi non siano vuote
             local key1=""
             local key2=""
-            
+
             if [[ -n "$dtstart" && -n "$summary" ]]; then
                 key1="${dtstart}|${summary}"
             fi
-            
+
             if [[ -n "$summary" ]]; then
                 key2="${summary}"
             fi
@@ -1143,13 +1143,17 @@ option_F() {
     else
         echo "📖 Per consultare il report in seguito:"
         echo "   vim '$sync_report'"
-        
+
     fi
 }
 
 # ----------------------------------------------------------------------
 # MENU INTERATTIVO
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# MENU INTERATTIVO
+# ----------------------------------------------------------------------
+echo "🔔 RICORDA: Assicurati di avere scaricato il file AGGIORNATO da Proton Calendar"
 echo "Scegli un'opzione:"
 echo "A) Importa eventi da Proton (merge - SOLO aggiunte)"
 echo "B) Sincronizza eventi con Proton (SOLO aggiunte)"
@@ -1158,14 +1162,20 @@ echo "D) Sincronizza con intervallo personalizzato"
 echo "---------"
 echo "E) 🧹 SYNC BIDIREZIONALE GUIDATA: Calcurse ↔ Proton + report"
 echo "F) 🔄 SYNC COMPLETA: Proton → Calcurse (SOSTITUISCE tutto)"
-read -rp "Inserisci A, B, C, D, E o F: " choice
+echo "---------"
+echo "Q) ❌ Esci senza operazioni"
+echo ""
+while true; do
+    read -rp "Inserisci A, B, C, D, E, F o Q: " choice
 
-case "${choice^^}" in
-    A) option_A ;;
-    B) option_B ;;
-    C) option_C ;;
-    D) option_D ;;
-    E) option_F ;;
-    F) option_E ;;
-    *) die "Scelta non valida. Usa A, B, C, D, E o F." ;;
-esac
+    case "${choice^^}" in
+        A) option_A; break ;;
+        B) option_B; break ;;
+        C) option_C; break ;;
+        D) option_D; break ;;
+        E) option_F; break ;;
+        F) option_E; break ;;
+        Q) echo "👋 Arrivederci!"; exit 0 ;;
+        *) echo "❌ Errore: Scelta non valida. Usa A, B, C, D, E, F o Q." ;;
+    esac
+done
