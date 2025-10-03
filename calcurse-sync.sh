@@ -743,12 +743,16 @@ option_A() {
             local summary=$(echo "$block" | grep "^SUMMARY:" | head -1 | cut -d: -f2- | sed 's/[[:space:]]*$//')
             local description=$(echo "$block" | grep "^DESCRIPTION:" | head -1 | cut -d: -f2- | sed 's/[[:space:]]*$//')
 
-            # Crea chiavi multiple per matching robusto
-            local key1="${dtstart}|${summary}"  # Data + Titolo
-            local key2="${summary}"             # Solo titolo (per eventi ricorrenti)
-
-            calcurse_events["$key1"]=1
-            calcurse_events["$key2"]=1
+            # Crea chiavi multiple per matching robusto - CORREZIONE: controlla che le chiavi non siano vuote
+            if [[ -n "$dtstart" && -n "$summary" ]]; then
+                local key1="${dtstart}|${summary}"  # Data + Titolo
+                calcurse_events["$key1"]=1
+            fi
+            
+            if [[ -n "$summary" ]]; then
+                local key2="${summary}"             # Solo titolo (per eventi ricorrenti)
+                calcurse_events["$key2"]=1
+            fi
 
             in_event=0
             block=""
@@ -778,9 +782,17 @@ option_A() {
             local summary=$(echo "$block" | grep "^SUMMARY:" | head -1 | cut -d: -f2- | sed 's/[[:space:]]*$//')
             local description=$(echo "$block" | grep "^DESCRIPTION:" | head -1 | cut -d: -f2- | sed 's/[[:space:]]*$//')
 
-            # Crea le stesse chiavi usate per Calcurse
-            local key1="${dtstart}|${summary}"
-            local key2="${summary}"
+            # Crea le stesse chiavi usate per Calcurse - CORREZIONE: controlla che le chiavi non siano vuote
+            local key1=""
+            local key2=""
+            
+            if [[ -n "$dtstart" && -n "$summary" ]]; then
+                key1="${dtstart}|${summary}"
+            fi
+            
+            if [[ -n "$summary" ]]; then
+                key2="${summary}"
+            fi
 
             local should_import=1
 
@@ -789,11 +801,11 @@ option_A() {
                 # echo "➖ Già presente (UID): $summary"
                 should_import=0
             # Controllo 2: Data + Titolo esatti
-            elif [[ -n "${calcurse_events[$key1]}" ]]; then
+            elif [[ -n "$key1" && -n "${calcurse_events[$key1]}" ]]; then
                 # echo "➖ Già presente (data+titolo): $summary ($dtstart)"
                 should_import=0
             # Controllo 3: Solo titolo (per eventi ricorrenti che potrebbero avere date diverse ma sono lo stesso evento)
-            elif [[ -n "${calcurse_events[$key2]}" ]]; then
+            elif [[ -n "$key2" && -n "${calcurse_events[$key2]}" ]]; then
                 # Per eventi ricorrenti, controlla più attentamente
                 local is_recurring=$(echo "$block" | grep -c "^RRULE:")
                 if [[ $is_recurring -gt 0 ]]; then
@@ -820,13 +832,13 @@ option_A() {
             fi
 
             # Controllo aggiuntivo: cerca eventi con stesso summary e data molto simile
-            if [[ $should_import -eq 1 ]]; then
+            if [[ $should_import -eq 1 && -n "$summary" ]]; then
                 for calcurse_key in "${!calcurse_events[@]}"; do
                     if [[ "$calcurse_key" == *"|$summary" ]]; then
                         local calcurse_dtstart=$(echo "$calcurse_key" | cut -d'|' -f1)
                         # Se le date sono simili (entro 24 ore) e il titolo è uguale, probabilmente è lo stesso evento
                         if [[ "${calcurse_dtstart:0:8}" == "${dtstart:0:8}" ]]; then
-#                            echo "➖ Escluso duplicato (data simile): $summary ($dtstart)"
+                            # echo "➖ Escluso duplicato (data simile): $summary ($dtstart)"
                             should_import=0
                             break
                         fi
@@ -837,7 +849,7 @@ option_A() {
             if [[ $should_import -eq 1 ]]; then
                 echo "$block" >> "$new_events_for_calcurse"
                 ((import_count++))
- #               echo "➕ Nuovo evento da importare: $summary ($dtstart)"
+                echo "➕ Nuovo evento da importare: $summary ($dtstart)"
             fi
 
             in_event=0
