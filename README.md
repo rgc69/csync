@@ -36,7 +36,7 @@ mkdir -p ~/Projects/calendar
 cd ~/Projects/calendar
 
 # Download the sync script
-wget -O calcurse-sync.sh https://raw.githubusercontent.com/yourusername/yourrepo/main/calcurse-sync.sh
+wget -O calcurse-sync.sh https://codeberg.org/rgc/csync.git
 chmod +x calcurse-sync.sh
 ```
 

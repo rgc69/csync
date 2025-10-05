@@ -518,7 +518,8 @@ option_A() {
     echo "🔄 SYNC BIDIREZIONALE INTERATTIVA: Calcurse ↔ Proton"
 
     export_calcurse_with_uids
-     # ============================================================
+
+    # ============================================================
     # CONTROLLO FRESHNESS DEL FILE PROTON
     # ============================================================
 
@@ -612,7 +613,9 @@ option_A() {
             local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
             local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n')
 
-            local key="${dtstart}"
+            local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
+            local key="${dtstart}||${rrule}"  # Chiave composta
+
             proton_events["$key"]="${summary}||${uid}"
             proton_blocks["$key"]="$block"
 
@@ -647,7 +650,9 @@ option_A() {
             local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
             local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n')
 
-            local key="${dtstart}"
+            local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
+            local key="${dtstart}||${rrule}"  # Chiave composta
+
             calcurse_events["$key"]="${summary}||${uid}"
             calcurse_blocks["$key"]="$block"
 
@@ -754,7 +759,8 @@ option_A() {
         echo "📥 Eventi da importare in Calcurse: ${#events_to_import_to_calcurse[@]}"
         for key in "${events_to_import_to_calcurse[@]}"; do
             IFS='||' read -r summary uid <<< "${proton_events[$key]}"
-            echo "   • ${summary:-[Senza titolo]} ($key)"
+            local dtstart_display="${key%%::*}"
+            echo "   • ${summary:-[Senza titolo]} ($dtstart_display)"
         done
         echo ""
     fi
@@ -763,7 +769,8 @@ option_A() {
         echo "🗑️  Eventi da eliminare da Calcurse: ${#events_to_delete_from_calcurse[@]}"
         for key in "${events_to_delete_from_calcurse[@]}"; do
             IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
-            echo "   • ${summary:-[Senza titolo]} ($key)"
+            local dtstart_display="${key%%::*}"
+            echo "   • ${summary:-[Senza titolo]} ($dtstart_display)"
         done
         echo ""
     fi
@@ -772,7 +779,8 @@ option_A() {
         echo "📤 Eventi da esportare verso Proton: ${#events_to_export_to_proton[@]}"
         for key in "${events_to_export_to_proton[@]}"; do
             IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
-            echo "   • ${summary:-[Senza titolo]} ($key)"
+            local dtstart_display="${key%%::*}"
+            echo "   • ${summary:-[Senza titolo]} ($dtstart_display)"
         done
         echo ""
     fi
@@ -814,54 +822,81 @@ option_A() {
     fi
 
     # FASE 2: Elimina eventi da Calcurse (tramite re-import filtrato)
-    if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
-        echo ""
-        echo "🗑️  Elimino ${#events_to_delete_from_calcurse[@]} eventi da Calcurse..."
+if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
+    echo ""
+    echo "🗑️  Elimino ${#events_to_delete_from_calcurse[@]} eventi da Calcurse..."
 
-        # Crea set per lookup veloce
-        declare -A to_delete
-        for key in "${events_to_delete_from_calcurse[@]}"; do
-            to_delete["$key"]=1
-        done
+    declare -A to_delete
+    echo "DEBUG: Chiavi da eliminare:"
+    for key in "${events_to_delete_from_calcurse[@]}"; do
+        to_delete["$key"]=1
+        echo "  -> [$key]"
+    done
 
-        # Esporta tutto eccetto gli eventi da eliminare
-        local filtered_temp=$(mktemp)
-        echo "BEGIN:VCALENDAR" > "$filtered_temp"
-        echo "VERSION:2.0" >> "$filtered_temp"
-        echo "PRODID:-//calcurse-sync//Filtered//" >> "$filtered_temp"
+    # Esporta TUTTO da Calcurse prima di modificare
+    local current_export=$(mktemp)
+    calcurse -D "$CALCURSE_DIR" --export > "$current_export"
 
-        block=""
-        in_event=0
+    local filtered_temp=$(mktemp)
+    echo "BEGIN:VCALENDAR" > "$filtered_temp"
+    echo "VERSION:2.0" >> "$filtered_temp"
+    echo "PRODID:-//calcurse-sync//Filtered//" >> "$filtered_temp"
 
-        while IFS= read -r line; do
-            if [[ "$line" == "BEGIN:VEVENT" ]]; then
-                block="$line"
-                in_event=1
-            elif [[ "$line" == "END:VEVENT" ]]; then
-                block+=$'\n'"$line"
+    block=""
+    in_event=0
+    local event_count=0
+    local kept_count=0
+    local deleted_count=0
 
-                local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
+    while IFS= read -r line; do
+        if [[ "$line" == "BEGIN:VEVENT" ]]; then
+            block="$line"
+            in_event=1
+        elif [[ "$line" == "END:VEVENT" ]]; then
+            block+=$'\n'"$line"
+            ((event_count++))
 
-                # Includi solo se NON è nella lista da eliminare
-                if [[ -z "${to_delete[$dtstart]}" ]]; then
-                    echo "$block" >> "$filtered_temp"
-                fi
+            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
+            local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
+            local key="${dtstart}||${rrule}"
 
-                in_event=0
-                block=""
-            elif (( in_event )); then
-                block+=$'\n'"$line"
+            echo "DEBUG: Evento #$event_count - Chiave estratta: [$key]"
+
+            # Includi solo se NON è nella lista da eliminare
+            if [[ -z "${to_delete[$key]}" ]]; then
+                echo "$block" >> "$filtered_temp"
+                ((kept_count++))
+                echo "  -> MANTENUTO"
+            else
+                ((deleted_count++))
+                echo "  -> ELIMINATO"
             fi
-        done < "$calcurse_tmp"
 
-        echo "END:VCALENDAR" >> "$filtered_temp"
+            in_event=0
+            block=""
+        elif (( in_event )); then
+            block+=$'\n'"$line"
+        fi
+    done < "$current_export"
 
-        # Sostituisci completamente Calcurse con il contenuto filtrato
-        > "$CALCURSE_DIR/apts"
-        calcurse -D "$CALCURSE_DIR" -i "$filtered_temp" || die "Eliminazione fallita"
-        rm -f "$filtered_temp"
-        echo "✅ Eliminazione completata"
-    fi
+    echo "END:VCALENDAR" >> "$filtered_temp"
+
+    echo ""
+    echo "DEBUG: Riepilogo processamento:"
+    echo "  - Eventi totali processati: $event_count"
+    echo "  - Eventi mantenuti: $kept_count"
+    echo "  - Eventi eliminati: $deleted_count"
+    echo ""
+
+    # SVUOTA COMPLETAMENTE la directory Calcurse
+    rm -f "$CALCURSE_DIR/apts" "$CALCURSE_DIR/todo"
+
+    # Re-importa il contenuto filtrato
+    calcurse -D "$CALCURSE_DIR" -i "$filtered_temp" || die "Eliminazione fallita"
+
+    rm -f "$current_export" "$filtered_temp"
+    echo "✅ Eliminazione completata"
+fi
 
     # FASE 3: Genera file per export a Proton
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
