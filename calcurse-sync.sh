@@ -93,7 +93,7 @@ convert_seconds_to_trigger() {
 
     if [ "$target" == "proton" ]; then
         local minutes=$(( (seconds + 30) / 60 ))
-
+        echo "DEBUG convert: seconds=$seconds, minutes=$minutes" >&2
         if [[ $minutes -le 5 ]]; then
             standard_minutes=5
         elif [[ $minutes -le 10 ]]; then
@@ -111,6 +111,7 @@ convert_seconds_to_trigger() {
         else
             standard_minutes=1440
         fi
+        echo "DEBUG convert: standard_minutes=$standard_minutes" >&2
         echo "-PT${standard_minutes}M"
     else
         echo "-P${seconds}S"
@@ -833,9 +834,10 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
         echo "  -> [$key]"
     done
 
-    # Esporta TUTTO da Calcurse prima di modificare
+    # Esporta SOLO appuntamenti (no TODO)
     local current_export=$(mktemp)
-    calcurse -D "$CALCURSE_DIR" --export > "$current_export"
+    calcurse -D "$CALCURSE_DIR" --export --export-uid | \
+        awk '/^BEGIN:VTODO/,/^END:VTODO/ {next} 1' > "$current_export"
 
     local filtered_temp=$(mktemp)
     echo "BEGIN:VCALENDAR" > "$filtered_temp"
@@ -889,7 +891,7 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     echo ""
 
     # SVUOTA COMPLETAMENTE la directory Calcurse
-    rm -f "$CALCURSE_DIR/apts" "$CALCURSE_DIR/todo"
+    rm -f "$CALCURSE_DIR/apts"
 
     # Re-importa il contenuto filtrato
     calcurse -D "$CALCURSE_DIR" -i "$filtered_temp" || die "Eliminazione fallita"
@@ -897,6 +899,27 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     rm -f "$current_export" "$filtered_temp"
     echo "✅ Eliminazione completata"
 fi
+    # Pulisce RRULE per compatibilità Proton
+clean_rrule_for_proton() {
+    local rrule="$1"
+    
+    # Rimuovi elementi non supportati da Proton
+    if [[ "$rrule" =~ FREQ=WEEKLY ]]; then
+        # Per ricorrenze settimanali, rimuovi BYMONTH
+        rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
+    fi
+    
+    # Rimuovi BYSETPOS (non supportato)
+    rrule=$(echo "$rrule" | sed 's/;BYSETPOS=[^;]*//g' | sed 's/BYSETPOS=[^;]*;//g')
+    
+    # Rimuovi BYSECOND, BYMINUTE, BYHOUR (non supportati)
+    rrule=$(echo "$rrule" | sed 's/;BY\(SECOND\|MINUTE\|HOUR\)=[^;]*//g')
+    
+    # Rimuovi WKST (ignorato da Proton comunque)
+    rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g' | sed 's/WKST=[^;]*;//g')
+    
+    echo "$rrule"
+}
 
     # FASE 3: Genera file per export a Proton
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
@@ -908,7 +931,23 @@ fi
         echo "PRODID:-//calcurse-sync//Export to Proton//" >> "$NEW_EVENTS_FILE"
 
         for key in "${events_to_export_to_proton[@]}"; do
-            local normalized=$(normalize_alarms "${calcurse_blocks[$key]}" "proton")
+            local event_block="${calcurse_blocks[$key]}"
+
+            # Pulisci RRULE per compatibilità Proton
+            local cleaned_block=""
+            local in_event=0
+
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^RRULE: ]]; then
+                    local rrule=$(echo "$line" | cut -d: -f2-)
+                    local cleaned_rrule=$(clean_rrule_for_proton "$rrule")
+                    cleaned_block+="RRULE:$cleaned_rrule"$'\n'
+                else
+                    cleaned_block+="$line"$'\n'
+                fi
+            done < <(echo "$event_block")
+
+            local normalized=$(normalize_alarms "$cleaned_block" "proton")
             normalized=$(echo "$normalized" | sed 's/BEGIN:VALARMTRIGGER/BEGIN:VALARM\nTRIGGER/g')
             normalized=$(echo "$normalized" | sed 's/BEGIN:VALARMACTION/BEGIN:VALARM\nACTION/g')
             echo "$normalized" >> "$NEW_EVENTS_FILE"
