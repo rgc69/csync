@@ -94,9 +94,9 @@ The script will:
 Choose an option:
 A) 🔄 INTERACTIVE BIDIRECTIONAL SYNC: Calcurse ↔ Proton (RECOMMENDED)
 B) Import events from Proton (merge - ONLY additions)
-C) Sync events with Proton (ONLY additions)
-D) Sync only future events (30 days)
-E) Sync with custom interval
+C) Export events to Proton (ONLY additions)
+D) Export only future events (30 days)
+E) Export with custom interval
 ---------
 F) 🔄 COMPLETE SYNC: Proton → Calcurse (REPLACES everything)
 Q) ❌ Exit without operations
