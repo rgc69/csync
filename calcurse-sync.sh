@@ -65,6 +65,7 @@ convert_trigger_to_seconds() {
     local seconds=0
 
     trigger=$(echo "$trigger" | tr -d '[:space:]')
+    echo "DEBUG trigger input: [$trigger]" >&2
 
     if [[ $trigger =~ ^-P([0-9]+)D$ ]]; then
         seconds=$(( ${BASH_REMATCH[1]} * 86400 ))
@@ -84,6 +85,7 @@ convert_trigger_to_seconds() {
         seconds=0
     fi
 
+    echo "DEBUG trigger output: $seconds seconds" >&2
     echo "$seconds"
 }
 
@@ -203,25 +205,25 @@ normalize_alarms() {
 
 clean_rrule_for_proton() {
     local rrule="$1"
-    
+
     echo "DEBUG clean_rrule INPUT: [$rrule]" >&2
-    
+
     # Rimuovi elementi non supportati da Proton
     if [[ "$rrule" =~ FREQ=WEEKLY ]]; then
         # Per ricorrenze settimanali, rimuovi BYMONTH
         rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
         echo "DEBUG clean_rrule AFTER BYMONTH: [$rrule]" >&2
     fi
-    
+
     # Rimuovi BYSETPOS (non supportato)
     rrule=$(echo "$rrule" | sed 's/;BYSETPOS=[^;]*//g' | sed 's/BYSETPOS=[^;]*;//g')
-    
+
     # Rimuovi BYSECOND, BYMINUTE, BYHOUR (non supportati)
     rrule=$(echo "$rrule" | sed 's/;BY\(SECOND\|MINUTE\|HOUR\)=[^;]*//g')
-    
+
     # Rimuovi WKST (ignorato da Proton comunque)
     rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g' | sed 's/WKST=[^;]*;//g')
-    
+
     echo "DEBUG clean_rrule OUTPUT: [$rrule]" >&2
     echo "$rrule"
 }
@@ -251,22 +253,45 @@ export_calcurse_with_uids() {
     echo "📤 Esporto i miei eventi con UID in $EXPORT_FILE…"
     local temp_export=$(mktemp)
     calcurse -D "$CALCURSE_DIR" --export > "$temp_export" || die "Esportazione fallita"
-
+    
+    # Leggi notification.warning dalla configurazione Calcurse
+    local notification_warning=""
+    local conf_paths=(
+        "${XDG_CONFIG_HOME:-$HOME/.config}/calcurse/conf"
+        "$HOME/.calcurse/conf"
+        "$CALCURSE_DIR/../conf"
+    )
+    
+    for conf_path in "${conf_paths[@]}"; do
+        if [[ -f "$conf_path" ]]; then
+            notification_warning=$(grep "^notification.warning=" "$conf_path" 2>/dev/null | cut -d= -f2)
+            if [[ -n "$notification_warning" ]]; then
+                echo "DEBUG: Letto notification.warning=$notification_warning da $conf_path" >&2
+                break
+            fi
+        fi
+    done
+    
+    # Default a 900 se non trovato
+    notification_warning=${notification_warning:-900}
+    echo "DEBUG: Usando notification.warning=$notification_warning secondi" >&2
+    
     local in_event=0
     local event_block=""
-
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
             event_block="$line"
             in_event=1
         elif [[ "$line" == "END:VEVENT" ]]; then
             event_block+=$'\n'"$line"
-
+            
+            # Sostituisci -P300S con il valore configurato
+            event_block=$(echo "$event_block" | sed "s/TRIGGER:-P300S/TRIGGER:-P${notification_warning}S/g")
+            
             if ! echo "$event_block" | grep -q "^UID:"; then
                 local uid=$(generate_event_uid "$event_block" "calcurse")
                 event_block=$(echo "$event_block" | sed "/^BEGIN:VEVENT/a UID:$uid")
             fi
-
             echo "$event_block"
             in_event=0
             event_block=""
@@ -276,7 +301,7 @@ export_calcurse_with_uids() {
             echo "$line"
         fi
     done < "$temp_export" > "$EXPORT_FILE"
-
+    
     rm -f "$temp_export"
     [[ -s "$EXPORT_FILE" ]] && echo "✅ Esportazione con UID completata"
 }
@@ -324,6 +349,7 @@ find_new_events() {
     local calcurse_file="$2"
     local output_file="$3"
 
+
     echo "🔍 Confronto i file .ics per trovare nuovi eventi…"
 
     [[ -f "$proton_file" ]]   || die "File Proton non trovato: $proton_file"
@@ -335,6 +361,10 @@ find_new_events() {
 
     awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$proton_file" | tr -d '\r' > "$proton_tmp"
     awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$calcurse_file" | tr -d '\r' > "$calcurse_tmp"
+
+    echo "DEBUG: Primi 3 eventi con TRIGGER da calcurse_tmp:" >&2
+    grep -A5 "^TRIGGER:" "$calcurse_tmp" | head -n 20 >&2
+    echo "---" >&2
 
     declare -A proton_hashes
     declare -A proton_uids
@@ -422,7 +452,7 @@ EOF
                         cleaned_block+="$line"$'\n'
                     fi
                 done < <(echo "$block")
-                
+
                 local normalized_event=$(normalize_alarms "$cleaned_block" "proton")
                 normalized_event=$(echo "$normalized_event" | sed 's/BEGIN:VALARMTRIGGER/BEGIN:VALARM\nTRIGGER/g')
                 normalized_event=$(echo "$normalized_event" | sed 's/BEGIN:VALARMACTION/BEGIN:VALARM\nACTION/g')
