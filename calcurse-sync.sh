@@ -198,6 +198,36 @@ normalize_alarms() {
 }
 
 # ----------------------------------------------------------------------
+# PULIZIA RRULE PER COMPATIBILITÀ PROTON
+# ----------------------------------------------------------------------
+
+clean_rrule_for_proton() {
+    local rrule="$1"
+    
+    echo "DEBUG clean_rrule INPUT: [$rrule]" >&2
+    
+    # Rimuovi elementi non supportati da Proton
+    if [[ "$rrule" =~ FREQ=WEEKLY ]]; then
+        # Per ricorrenze settimanali, rimuovi BYMONTH
+        rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
+        echo "DEBUG clean_rrule AFTER BYMONTH: [$rrule]" >&2
+    fi
+    
+    # Rimuovi BYSETPOS (non supportato)
+    rrule=$(echo "$rrule" | sed 's/;BYSETPOS=[^;]*//g' | sed 's/BYSETPOS=[^;]*;//g')
+    
+    # Rimuovi BYSECOND, BYMINUTE, BYHOUR (non supportati)
+    rrule=$(echo "$rrule" | sed 's/;BY\(SECOND\|MINUTE\|HOUR\)=[^;]*//g')
+    
+    # Rimuovi WKST (ignorato da Proton comunque)
+    rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g' | sed 's/WKST=[^;]*;//g')
+    
+    echo "DEBUG clean_rrule OUTPUT: [$rrule]" >&2
+    echo "$rrule"
+}
+
+
+# ----------------------------------------------------------------------
 # FUNZIONI PER LA GESTIONE DEGLI UID
 # ----------------------------------------------------------------------
 
@@ -382,7 +412,18 @@ EOF
             fi
 
             if [[ $is_duplicate -eq 0 ]]; then
-                local normalized_event=$(normalize_alarms "$block" "proton")
+                local cleaned_block=""
+                while IFS= read -r line; do
+                    if [[ "$line" =~ ^RRULE: ]]; then
+                        local rrule=$(echo "$line" | cut -d: -f2-)
+                        local cleaned_rrule=$(clean_rrule_for_proton "$rrule")
+                        cleaned_block+="RRULE:$cleaned_rrule"$'\n'
+                    else
+                        cleaned_block+="$line"$'\n'
+                    fi
+                done < <(echo "$block")
+                
+                local normalized_event=$(normalize_alarms "$cleaned_block" "proton")
                 normalized_event=$(echo "$normalized_event" | sed 's/BEGIN:VALARMTRIGGER/BEGIN:VALARM\nTRIGGER/g')
                 normalized_event=$(echo "$normalized_event" | sed 's/BEGIN:VALARMACTION/BEGIN:VALARM\nACTION/g')
 
@@ -899,27 +940,6 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     rm -f "$current_export" "$filtered_temp"
     echo "✅ Eliminazione completata"
 fi
-    # Pulisce RRULE per compatibilità Proton
-clean_rrule_for_proton() {
-    local rrule="$1"
-    
-    # Rimuovi elementi non supportati da Proton
-    if [[ "$rrule" =~ FREQ=WEEKLY ]]; then
-        # Per ricorrenze settimanali, rimuovi BYMONTH
-        rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
-    fi
-    
-    # Rimuovi BYSETPOS (non supportato)
-    rrule=$(echo "$rrule" | sed 's/;BYSETPOS=[^;]*//g' | sed 's/BYSETPOS=[^;]*;//g')
-    
-    # Rimuovi BYSECOND, BYMINUTE, BYHOUR (non supportati)
-    rrule=$(echo "$rrule" | sed 's/;BY\(SECOND\|MINUTE\|HOUR\)=[^;]*//g')
-    
-    # Rimuovi WKST (ignorato da Proton comunque)
-    rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g' | sed 's/WKST=[^;]*;//g')
-    
-    echo "$rrule"
-}
 
     # FASE 3: Genera file per export a Proton
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
