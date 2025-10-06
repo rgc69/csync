@@ -226,39 +226,54 @@ clean_rrule_for_proton() {
 # ----------------------------------------------------------------------
 enrich_event_for_proton() {
     local event_block="$1"
-    local enriched=""
-    local in_vevent=0
+    local user_tz="${TZ:-Europe/Rome}"
+    local result=""
     local has_dtstamp=0
     local has_sequence=0
+    local dtstart="" dtend="" duration=""
     
+    # Prima passata: leggi e converti DURATION -> DTEND
     while IFS= read -r line; do
-        # Controlla se abbiamo già questi campi
-        [[ "$line" =~ ^DTSTAMP: ]] && has_dtstamp=1
-        [[ "$line" =~ ^SEQUENCE: ]] && has_sequence=1
-        
-        enriched+="$line"$'\n'
-        
-        # Dopo BEGIN:VEVENT, aggiungi DTSTAMP se manca
-        if [[ "$line" == "BEGIN:VEVENT" ]]; then
-            in_vevent=1
-        fi
-        
-        # Dopo UID, aggiungi DTSTAMP se mancante
-        if [[ $in_vevent -eq 1 ]] && [[ "$line" =~ ^UID: ]] && [[ $has_dtstamp -eq 0 ]]; then
-            enriched+="DTSTAMP:$(date -u +%Y%m%dT%H%M%SZ)"$'\n'
-            has_dtstamp=1
-        fi
-        
-        # Prima di END:VEVENT, aggiungi SEQUENCE se manca
-        if [[ "$line" == "END:VEVENT" ]] && [[ $has_sequence -eq 0 ]]; then
-            enriched="$(echo "$enriched" | sed '$d')"  # Rimuovi ultima newline
-            enriched+="SEQUENCE:0"$'\n'
-            enriched+="END:VEVENT"$'\n'
-            has_sequence=1
+        if [[ "$line" =~ ^DTSTART:(.+) ]]; then
+            dtstart="${BASH_REMATCH[1]}"
+            result+="DTSTART;TZID=$user_tz:$dtstart"$'\n'
+        elif [[ "$line" =~ ^DURATION:(.+) ]]; then
+            duration="${BASH_REMATCH[1]}"
+            # Calcola DTEND (parsing semplificato)
+            local hours=0 minutes=0
+            [[ "$duration" =~ ([0-9]+)H ]] && hours=${BASH_REMATCH[1]}
+            [[ "$duration" =~ ([0-9]+)M ]] && minutes=${BASH_REMATCH[1]}
+            
+            local total_minutes=$((hours * 60 + minutes))
+            local start_hour=${dtstart:9:2}
+            local start_min=${dtstart:11:2}
+            local end_minutes=$((10#$start_hour * 60 + 10#$start_min + total_minutes))
+            local end_hour=$((end_minutes / 60))
+            local end_min=$((end_minutes % 60))
+            
+            dtend=$(printf "%s%02d%02d00" "${dtstart:0:9}" $end_hour $end_min)
+            result+="DTEND;TZID=$user_tz:$dtend"$'\n'
+        elif [[ "$line" =~ ^UID: ]]; then
+            result+="$line"$'\n'
+            if [[ $has_dtstamp -eq 0 ]]; then
+                result+="DTSTAMP:$(date -u +%Y%m%dT%H%M%SZ)"$'\n'
+                has_dtstamp=1
+            fi
+        elif [[ "$line" == "BEGIN:VALARM" || "$line" == "END:VEVENT" ]]; then
+            if [[ $has_sequence -eq 0 ]]; then
+                result+="SEQUENCE:0"$'\n'
+                result+="STATUS:CONFIRMED"$'\n'
+                has_sequence=1
+            fi
+            result+="$line"$'\n'
+        else
+            [[ "$line" =~ ^DTSTAMP: ]] && has_dtstamp=1
+            [[ "$line" =~ ^SEQUENCE: ]] && has_sequence=1
+            result+="$line"$'\n'
         fi
     done < <(echo "$event_block")
     
-    echo "${enriched%$'\n'}"  # Rimuovi trailing newline
+    echo "${result%$'\n'}"
 }
 
 # ----------------------------------------------------------------------
