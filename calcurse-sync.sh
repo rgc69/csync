@@ -65,7 +65,6 @@ convert_trigger_to_seconds() {
     local seconds=0
 
     trigger=$(echo "$trigger" | tr -d '[:space:]')
-    echo "DEBUG trigger input: [$trigger]" >&2
 
     if [[ $trigger =~ ^-P([0-9]+)D$ ]]; then
         seconds=$(( ${BASH_REMATCH[1]} * 86400 ))
@@ -85,7 +84,6 @@ convert_trigger_to_seconds() {
         seconds=0
     fi
 
-    echo "DEBUG trigger output: $seconds seconds" >&2
     echo "$seconds"
 }
 
@@ -95,7 +93,6 @@ convert_seconds_to_trigger() {
 
     if [ "$target" == "proton" ]; then
         local minutes=$(( (seconds + 30) / 60 ))
-        echo "DEBUG convert: seconds=$seconds, minutes=$minutes" >&2
         if [[ $minutes -le 5 ]]; then
             standard_minutes=5
         elif [[ $minutes -le 10 ]]; then
@@ -113,7 +110,6 @@ convert_seconds_to_trigger() {
         else
             standard_minutes=1440
         fi
-        echo "DEBUG convert: standard_minutes=$standard_minutes" >&2
         echo "-PT${standard_minutes}M"
     else
         echo "-P${seconds}S"
@@ -206,13 +202,11 @@ normalize_alarms() {
 clean_rrule_for_proton() {
     local rrule="$1"
 
-    echo "DEBUG clean_rrule INPUT: [$rrule]" >&2
 
     # Rimuovi elementi non supportati da Proton
     if [[ "$rrule" =~ FREQ=WEEKLY ]]; then
         # Per ricorrenze settimanali, rimuovi BYMONTH
         rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
-        echo "DEBUG clean_rrule AFTER BYMONTH: [$rrule]" >&2
     fi
 
     # Rimuovi BYSETPOS (non supportato)
@@ -224,10 +218,48 @@ clean_rrule_for_proton() {
     # Rimuovi WKST (ignorato da Proton comunque)
     rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g' | sed 's/WKST=[^;]*;//g')
 
-    echo "DEBUG clean_rrule OUTPUT: [$rrule]" >&2
     echo "$rrule"
 }
 
+# ----------------------------------------------------------------------
+# ARRICCHIMENTO EVENTI PER COMPATIBILITÀ PROTON
+# ----------------------------------------------------------------------
+enrich_event_for_proton() {
+    local event_block="$1"
+    local enriched=""
+    local in_vevent=0
+    local has_dtstamp=0
+    local has_sequence=0
+    
+    while IFS= read -r line; do
+        # Controlla se abbiamo già questi campi
+        [[ "$line" =~ ^DTSTAMP: ]] && has_dtstamp=1
+        [[ "$line" =~ ^SEQUENCE: ]] && has_sequence=1
+        
+        enriched+="$line"$'\n'
+        
+        # Dopo BEGIN:VEVENT, aggiungi DTSTAMP se manca
+        if [[ "$line" == "BEGIN:VEVENT" ]]; then
+            in_vevent=1
+        fi
+        
+        # Dopo UID, aggiungi DTSTAMP se mancante
+        if [[ $in_vevent -eq 1 ]] && [[ "$line" =~ ^UID: ]] && [[ $has_dtstamp -eq 0 ]]; then
+            enriched+="DTSTAMP:$(date -u +%Y%m%dT%H%M%SZ)"$'\n'
+            has_dtstamp=1
+        fi
+        
+        # Prima di END:VEVENT, aggiungi SEQUENCE se manca
+        if [[ "$line" == "END:VEVENT" ]] && [[ $has_sequence -eq 0 ]]; then
+            enriched="$(echo "$enriched" | sed '$d')"  # Rimuovi ultima newline
+            enriched+="SEQUENCE:0"$'\n'
+            enriched+="END:VEVENT"$'\n'
+            has_sequence=1
+        fi
+    done < <(echo "$event_block")
+    
+    echo "${enriched%$'\n'}"  # Rimuovi trailing newline
+}
 
 # ----------------------------------------------------------------------
 # FUNZIONI PER LA GESTIONE DEGLI UID
@@ -253,7 +285,7 @@ export_calcurse_with_uids() {
     echo "📤 Esporto i miei eventi con UID in $EXPORT_FILE…"
     local temp_export=$(mktemp)
     calcurse -D "$CALCURSE_DIR" --export > "$temp_export" || die "Esportazione fallita"
-    
+
     # Leggi notification.warning dalla configurazione Calcurse
     local notification_warning=""
     local conf_paths=(
@@ -261,21 +293,19 @@ export_calcurse_with_uids() {
         "$HOME/.calcurse/conf"
         "$CALCURSE_DIR/../conf"
     )
-    
+
     for conf_path in "${conf_paths[@]}"; do
         if [[ -f "$conf_path" ]]; then
             notification_warning=$(grep "^notification.warning=" "$conf_path" 2>/dev/null | cut -d= -f2)
             if [[ -n "$notification_warning" ]]; then
-                echo "DEBUG: Letto notification.warning=$notification_warning da $conf_path" >&2
                 break
             fi
         fi
     done
-    
+
     # Default a 900 se non trovato
     notification_warning=${notification_warning:-900}
-    echo "DEBUG: Usando notification.warning=$notification_warning secondi" >&2
-    
+
     local in_event=0
     local event_block=""
     while IFS= read -r line; do
@@ -284,10 +314,10 @@ export_calcurse_with_uids() {
             in_event=1
         elif [[ "$line" == "END:VEVENT" ]]; then
             event_block+=$'\n'"$line"
-            
+
             # Sostituisci -P300S con il valore configurato
             event_block=$(echo "$event_block" | sed "s/TRIGGER:-P300S/TRIGGER:-P${notification_warning}S/g")
-            
+
             if ! echo "$event_block" | grep -q "^UID:"; then
                 local uid=$(generate_event_uid "$event_block" "calcurse")
                 event_block=$(echo "$event_block" | sed "/^BEGIN:VEVENT/a UID:$uid")
@@ -301,7 +331,7 @@ export_calcurse_with_uids() {
             echo "$line"
         fi
     done < "$temp_export" > "$EXPORT_FILE"
-    
+
     rm -f "$temp_export"
     [[ -s "$EXPORT_FILE" ]] && echo "✅ Esportazione con UID completata"
 }
@@ -362,9 +392,6 @@ find_new_events() {
     awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$proton_file" | tr -d '\r' > "$proton_tmp"
     awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$calcurse_file" | tr -d '\r' > "$calcurse_tmp"
 
-    echo "DEBUG: Primi 3 eventi con TRIGGER da calcurse_tmp:" >&2
-    grep -A5 "^TRIGGER:" "$calcurse_tmp" | head -n 20 >&2
-    echo "---" >&2
 
     declare -A proton_hashes
     declare -A proton_uids
@@ -442,16 +469,17 @@ EOF
             fi
 
             if [[ $is_duplicate -eq 0 ]]; then
+                local enriched_block=$(enrich_event_for_proton "$block")
                 local cleaned_block=""
                 while IFS= read -r line; do
                     if [[ "$line" =~ ^RRULE: ]]; then
-                        local rrule=$(echo "$line" | cut -d: -f2-)
+                        local rrule="${line#RRULE:}"
                         local cleaned_rrule=$(clean_rrule_for_proton "$rrule")
                         cleaned_block+="RRULE:$cleaned_rrule"$'\n'
                     else
                         cleaned_block+="$line"$'\n'
                     fi
-                done < <(echo "$block")
+                done < <(echo "$enriched_block")
 
                 local normalized_event=$(normalize_alarms "$cleaned_block" "proton")
                 normalized_event=$(echo "$normalized_event" | sed 's/BEGIN:VALARMTRIGGER/BEGIN:VALARM\nTRIGGER/g')
@@ -899,7 +927,7 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     echo "🗑️  Elimino ${#events_to_delete_from_calcurse[@]} eventi da Calcurse..."
 
     declare -A to_delete
-    echo "DEBUG: Chiavi da eliminare:"
+    #echo "DEBUG: Chiavi da eliminare:"
     for key in "${events_to_delete_from_calcurse[@]}"; do
         to_delete["$key"]=1
         echo "  -> [$key]"
@@ -933,7 +961,7 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
             local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
             local key="${dtstart}||${rrule}"
 
-            echo "DEBUG: Evento #$event_count - Chiave estratta: [$key]"
+            #echo "DEBUG: Evento #$event_count - Chiave estratta: [$key]"
 
             # Includi solo se NON è nella lista da eliminare
             if [[ -z "${to_delete[$key]}" ]]; then
@@ -982,18 +1010,19 @@ fi
 
         for key in "${events_to_export_to_proton[@]}"; do
             local event_block="${calcurse_blocks[$key]}"
-
-            # Pulisci RRULE per compatibilità Proton
+            
+            # Arricchisci per Proton
+            event_block=$(enrich_event_for_proton "$event_block")
+            
+            # Pulisci RRULE
             local cleaned_block=""
-            local in_event=0
-
             while IFS= read -r line; do
                 if [[ "$line" =~ ^RRULE: ]]; then
-                    local rrule=$(echo "$line" | cut -d: -f2-)
+                    local rrule="${line#RRULE:}"
                     local cleaned_rrule=$(clean_rrule_for_proton "$rrule")
-                    cleaned_block+="RRULE:$cleaned_rrule"$'\n'
+                    cleaned_block+="RRULE:${cleaned_rrule}"$'\n'
                 else
-                    cleaned_block+="$line"$'\n'
+                    cleaned_block+="${line}"$'\n'
                 fi
             done < <(echo "$event_block")
 
