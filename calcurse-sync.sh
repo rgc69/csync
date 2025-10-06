@@ -231,7 +231,7 @@ enrich_event_for_proton() {
     local has_dtstamp=0
     local has_sequence=0
     local dtstart="" dtend="" duration=""
-    
+
     # Prima passata: leggi e converti DURATION -> DTEND
     while IFS= read -r line; do
         if [[ "$line" =~ ^DTSTART:(.+) ]]; then
@@ -243,14 +243,14 @@ enrich_event_for_proton() {
             local hours=0 minutes=0
             [[ "$duration" =~ ([0-9]+)H ]] && hours=${BASH_REMATCH[1]}
             [[ "$duration" =~ ([0-9]+)M ]] && minutes=${BASH_REMATCH[1]}
-            
+
             local total_minutes=$((hours * 60 + minutes))
             local start_hour=${dtstart:9:2}
             local start_min=${dtstart:11:2}
             local end_minutes=$((10#$start_hour * 60 + 10#$start_min + total_minutes))
             local end_hour=$((end_minutes / 60))
             local end_min=$((end_minutes % 60))
-            
+
             dtend=$(printf "%s%02d%02d00" "${dtstart:0:9}" $end_hour $end_min)
             result+="DTEND;TZID=$user_tz:$dtend"$'\n'
         elif [[ "$line" =~ ^UID: ]]; then
@@ -272,7 +272,7 @@ enrich_event_for_proton() {
             result+="$line"$'\n'
         fi
     done < <(echo "$event_block")
-    
+
     echo "${result%$'\n'}"
 }
 
@@ -803,7 +803,7 @@ option_A() {
             echo "   📅 Data/Ora: $key"
             echo "   🆔 UID: $uid"
             echo ""
-            read -rp "   ➡️  Vuoi importarlo in Calcurse? (s/N): " import_choice
+            read -rp "   ➡️  Vuoi importarlo in Calcurse? (y/N): " import_choice
 
             if [[ "$import_choice" =~ ^[sSyY]$ ]]; then
                 events_to_import_to_calcurse+=("$key")
@@ -900,7 +900,7 @@ option_A() {
         echo ""
     fi
 
-    read -rp "Confermi l'applicazione di queste modifiche? (s/N): " confirm
+    read -rp "Confermi l'applicazione di queste modifiche? (y/N): " confirm
 
     if [[ ! "$confirm" =~ ^[sSyY]$ ]]; then
         echo "❌ Operazione annullata dall'utente"
@@ -1025,10 +1025,10 @@ fi
 
         for key in "${events_to_export_to_proton[@]}"; do
             local event_block="${calcurse_blocks[$key]}"
-            
+
             # Arricchisci per Proton
             event_block=$(enrich_event_for_proton "$event_block")
-            
+
             # Pulisci RRULE
             local cleaned_block=""
             while IFS= read -r line; do
@@ -1080,7 +1080,7 @@ fi
 
 
 option_B() {
-    echo "➡️ Importa eventi da Proton (merge)"
+  echo "➡️ Import events from Proton (merge - ONLY additions)"
 
 
     # ============================================================
@@ -1279,7 +1279,7 @@ option_B() {
 }
 
 option_C() {
-    echo "➡️ Sincronizza tutti gli eventi con Proton"
+    echo "➡️ Export events to Proton"
     export_calcurse_with_uids
     find_and_prepare_proton_file
     find_new_events "$IMPORT_FILE" "$EXPORT_FILE" "$NEW_EVENTS_FILE"
@@ -1287,7 +1287,7 @@ option_C() {
 }
 
 option_D() {
-    echo "➡️ Sincronizza solo eventi futuri (30 giorni)"
+    echo "➡️ Export future events only (30 days)"
     export_calcurse_with_uids
     find_and_prepare_proton_file
 
@@ -1304,8 +1304,8 @@ option_D() {
 }
 
 option_E() {
-    echo "➡️ Sincronizza con intervallo personalizzato"
-    read -rp "Giorni nel futuro da includere (default: 90): " days_future
+    echo "➡️ Export with custom interval"
+    read -rp "Days in the future to include (default: 90): " days_future
     days_future=${days_future:-90}
 
     export_calcurse_with_uids
@@ -1324,13 +1324,13 @@ option_E() {
 }
 
 option_F() {
-    echo "🔄 SYNC COMPLETA: Proton → Calcurse"
-    echo "⚠️ ATTENZIONE: Questo sostituirà completamente Calcurse con Proton"
-    echo "   Tutti gli eventi in Calcurse non presenti in Proton verranno PERDUTI!"
+    echo "🔄 COMPLETE SYNC: Proton → Calcurse"
+    echo "⚠️  WARNING: This will completely replace Calcurse with Proton "
+    echo "   All events in Calcurse not present in Proton will be LOST!"
 
-    read -rp "Sei sicuro? (scrivi 'CONFERMO' per procedere): " confirmation
-    if [[ "$confirmation" != "CONFERMO" ]]; then
-        echo "❌ Sincronizzazione annullata"
+    read -rp "Are you sure? (type 'CONFIRM' to proceed): " confirmation
+    if [[ "$confirmation" != "CONFIRM" ]]; then
+        echo "❌ Synchronization cancelled"
         return 1
     fi
 
@@ -1352,21 +1352,21 @@ option_F() {
     echo "📂 Backup salvato: $BACKUP_FILE"
 }
 
-echo "🔔 RICORDA: Assicurati di avere scaricato il file AGGIORNATO da Proton Calendar"
-echo "Scegli un'opzione:"
-echo "A) 🧹 SYNC BIDIREZIONALE GUIDATA: Calcurse ↔ Proton + report"
-echo "B) Importa eventi da Proton (merge - SOLO aggiunte)"
-echo "C) Sincronizza eventi con Proton (SOLO aggiunte)"
-echo "D) Sincronizza solo eventi futuri (30 giorni)"
-echo "E) Sincronizza con intervallo personalizzato"
+echo "🔔 REMEMBER: Make sure you have downloaded the UPDATED file from Proton Calendar"
+echo "Choose an option:"
+echo "A) 🧹 GUIDED BIDIRECTIONAL SYNC: Calcurse ↔ Proton + report"
+echo "B) Import events from Proton (merge - ONLY additions)"
+echo "C) Export events to Proton (ONLY additions)"
+echo "D) Export only future events (30 days)"
+echo "E) Export with custom interval"
 echo "---------"
-echo "F) 🔄 SYNC COMPLETA: Proton → Calcurse (SOSTITUISCE tutto)"
+echo "F) 🔄 COMPLETE SYNC: Proton → Calcurse (REPLACES everything)"
 echo "---------"
-echo "Q) ❌ Esci senza operazioni"
+echo "Q) ❌ Exit without operations"
 echo ""
 
 while true; do
-    read -rp "Inserisci A, B, C, D, E, F o Q: " choice
+    read -rp "Enter A, B, C, D, E, F o Q: " choice
 
     case "${choice^^}" in
         A) option_A; break ;;
@@ -1375,7 +1375,7 @@ while true; do
         D) option_D; break ;;
         E) option_E; break ;;
         F) option_F; break ;;
-        Q) echo "👋 Arrivederci!"; exit 0 ;;
-        *) echo "❌ Errore: Scelta non valida. Usa A, B, C, D, E, F o Q." ;;
+        Q) echo "👋 Goodbye!"; exit 0 ;;
+        *) echo "❌ Error: Invalid choice. Use A, B, C, D, E, F or Q." ;;
     esac
 done
