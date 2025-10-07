@@ -113,7 +113,7 @@ csync # Choose option B
 
 **For exporting new Calcurse events (Options C/D/E):**
 ```bash
-csync # Choose option C (future events), D (custom range), or E (all events)
+csync # Choose option C (all events), D (future events), or E (custom range)
 # Generates a file to import into Proton Calendar manually
 ```
 
