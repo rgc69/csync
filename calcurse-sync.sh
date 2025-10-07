@@ -277,6 +277,49 @@ enrich_event_for_proton() {
 }
 
 # ----------------------------------------------------------------------
+# CONTROLLO SE SYNC EXPORT NECESSARIA (solo per C/D/E)
+# ----------------------------------------------------------------------
+check_if_export_needed() {
+    local last_export_file="$BACKUP_DIR/.last_calcurse_export"
+    
+    # Controlla il database Calcurse, non l'export
+    local calcurse_db="$CALCURSE_DIR/apts"
+    
+    if [[ ! -f "$calcurse_db" ]]; then
+        echo "⚠️  Calcurse database not found"
+        return 0
+    fi
+    
+    # Se non esiste timestamp precedente, export necessario
+    if [[ ! -f "$last_export_file" ]]; then
+        return 0
+    fi
+    
+    local last_export=$(cat "$last_export_file")
+    local calcurse_mtime=$(stat -c %Y "$calcurse_db" 2>/dev/null || stat -f %m "$calcurse_db" 2>/dev/null)
+    
+    # Se il database Calcurse NON è cambiato dall'ultimo export
+    if [[ $calcurse_mtime -le $last_export ]]; then
+        echo ""
+        echo "ℹ️  No changes in Calcurse since last export"
+        echo "   Last export: $(date -d @$last_export '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r $last_export '+%Y-%m-%d %H:%M:%S')"
+        echo "   Calcurse DB last modified: $(date -d @$calcurse_mtime '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r $calcurse_mtime '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+        read -rp "   Continue export anyway? (y/N): " proceed
+        
+        if [[ ! "$proceed" =~ ^[yY]$ ]]; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+save_export_timestamp() {
+    echo "$(date +%s)" > "$BACKUP_DIR/.last_calcurse_export"
+}
+
+# ----------------------------------------------------------------------
 # FUNZIONI PER LA GESTIONE DEGLI UID
 # ----------------------------------------------------------------------
 
@@ -1281,14 +1324,26 @@ option_B() {
 option_C() {
     echo "➡️ Export events to Proton"
     export_calcurse_with_uids
+    # Check if Calcurse is changed
+    if ! check_if_export_needed; then
+        echo "⏭️  Export skipped - no changes in Calcurse"
+        return 0
+    fi
     find_and_prepare_proton_file
     find_new_events "$IMPORT_FILE" "$EXPORT_FILE" "$NEW_EVENTS_FILE"
+     # Salva timestamp DOPO export riuscito
+    save_export_timestamp
     echo "📂 File per Proton: $NEW_EVENTS_FILE"
 }
 
 option_D() {
     echo "➡️ Export future events only (30 days)"
     export_calcurse_with_uids
+    # Check if Calcurse is changed
+    if ! check_if_export_needed; then
+        echo "⏭️  Export skipped - no changes in Calcurse"
+        return 0
+    fi
     find_and_prepare_proton_file
 
     local proton_filtered=$(mktemp)
@@ -1300,6 +1355,7 @@ option_D() {
     find_new_events "$proton_filtered" "$calcurse_filtered" "$NEW_EVENTS_FILE"
 
     rm -f "$proton_filtered" "$calcurse_filtered"
+    save_export_timestamp
     echo "📂 File per Proton (solo eventi futuri): $NEW_EVENTS_FILE"
 }
 
@@ -1309,6 +1365,10 @@ option_E() {
     days_future=${days_future:-90}
 
     export_calcurse_with_uids
+    if ! check_if_export_needed; then
+        echo "⏭️  Export skipped - no changes in Calcurse"
+        return 0
+    fi
     find_and_prepare_proton_file
 
     local proton_filtered=$(mktemp)
@@ -1320,6 +1380,7 @@ option_E() {
     find_new_events "$proton_filtered" "$calcurse_filtered" "$NEW_EVENTS_FILE"
 
     rm -f "$proton_filtered" "$calcurse_filtered"
+    save_export_timestamp
     echo "📂 File per Proton (prossimi $days_future giorni): $NEW_EVENTS_FILE"
 }
 

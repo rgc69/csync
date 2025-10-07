@@ -99,6 +99,7 @@ D) Export only future events (30 days)
 E) Export with custom interval
 ---------
 F) 🔄 COMPLETE SYNC: Proton → Calcurse (REPLACES everything)
+---------
 Q) ❌ Exit without operations
 ```
 
@@ -112,7 +113,7 @@ csync # Choose option B
 
 **For exporting new Calcurse events (Options C/D/E):**
 ```bash
-csync # Choose option C (all events), D (future events), or E (custom range) 
+csync # Choose option C (future events), D (custom range), or E (all events)
 # Generates a file to import into Proton Calendar manually
 ```
 
@@ -139,16 +140,25 @@ csync # Choose option F
 
 The script uses **hash-based event comparison** for optimal performance:
 - **Time complexity**: O(n + m) instead of O(n × m)
-- **Event identification**: Uses `DTSTART` as primary key
+- **Event identification**: Uses `DTSTART + RRULE` as composite primary key
 - **Fast lookups**: Bash associative arrays for O(1) comparisons
 - Handles hundreds of events efficiently
+
+**Real-world performance example:**
+- For 500 events in Calcurse and 500 events in Proton:
+  - **Without optimization**: ~250,000 comparisons (nested loops)
+  - **With hash-based indexing**: ~1,000 operations (index + lookup)
+  - **Result**: 250x faster
+
+Additionally, **export operations (C/D/E) include smart caching**: the script tracks the last modification time of your Calcurse database. If no changes are detected since the last export, you'll be prompted to skip the comparison entirely, saving even more time.
 
 ### Event Matching Strategy
 
 Events are matched using:
-1. **Primary key**: `DTSTART` (event start date/time)
+1. **Composite primary key**: `DTSTART + RRULE` (handles recurring events correctly)
 2. **Stored metadata**: Summary and UID for display and verification
 3. **Alarm normalization**: Reminders rounded to 5-minute intervals for comparison
+4. **RRULE cleaning**: Automatically removes unsupported rules (e.g., `BYMONTH` in weekly recurrences)
 
 ### Alarm Conversion
 
