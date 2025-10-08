@@ -24,16 +24,11 @@ die() {
 # FUNZIONE PULIZIA BACKUP
 # ----------------------------------------------------------------------
 clean_old_backups() {
-    echo "🧹 Pulizia vecchi backup (mantenendo solo gli ultimi 3)..."
     local backup_files=("$BACKUP_DIR"/backup_*.ics)
     if [[ ${#backup_files[@]} -gt 3 ]]; then
         for file in $(ls -1 "$BACKUP_DIR"/backup_*.ics | sort | head -n -3); do
-            echo "Rimuovo: $(basename "$file")"
             rm -- "$file"
         done
-        echo "✅ Backup puliti: mantenuti solo gli ultimi 3"
-    else
-        echo "✅ Meno di 3 backup, nessuna pulizia necessaria"
     fi
 }
 
@@ -46,13 +41,11 @@ find_and_prepare_proton_file() {
     proton_file=$(find "$BACKUP_DIR" -maxdepth 1 \( -name "My calendar-*.ics" -o -name "My Calendar-*.ics" \) -type f | sort -r | head -n1)
 
     if [[ -n "$proton_file" ]]; then
-        echo "📄 Trovato nuovo file Proton: $(basename "$proton_file")"
         mv "$proton_file" "$IMPORT_FILE"
-        echo "✅ File rinominato in: $(basename "$IMPORT_FILE")"
     elif [[ -f "$IMPORT_FILE" ]]; then
-        echo "📂 Uso file Proton esistente: $(basename "$IMPORT_FILE")"
+        :
     else
-        die "Nessun file Proton trovato e $IMPORT_FILE non esiste"
+        die "No Proton file found and $IMPORT_FILE does not exist"
     fi
 }
 
@@ -281,23 +274,23 @@ enrich_event_for_proton() {
 # ----------------------------------------------------------------------
 check_if_export_needed() {
     local last_export_file="$BACKUP_DIR/.last_calcurse_export"
-    
+
     # Controlla il database Calcurse, non l'export
     local calcurse_db="$CALCURSE_DIR/apts"
-    
+
     if [[ ! -f "$calcurse_db" ]]; then
         echo "⚠️  Calcurse database not found"
         return 0
     fi
-    
+
     # Se non esiste timestamp precedente, export necessario
     if [[ ! -f "$last_export_file" ]]; then
         return 0
     fi
-    
+
     local last_export=$(cat "$last_export_file")
     local calcurse_mtime=$(stat -c %Y "$calcurse_db" 2>/dev/null || stat -f %m "$calcurse_db" 2>/dev/null)
-    
+
     # Se il database Calcurse NON è cambiato dall'ultimo export
     if [[ $calcurse_mtime -le $last_export ]]; then
         echo ""
@@ -306,12 +299,12 @@ check_if_export_needed() {
         echo "   Calcurse DB last modified: $(date -d @$calcurse_mtime '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r $calcurse_mtime '+%Y-%m-%d %H:%M:%S')"
         echo ""
         read -rp "   Continue export anyway? (y/N): " proceed
-        
+
         if [[ ! "$proceed" =~ ^[yY]$ ]]; then
             return 1
         fi
     fi
-    
+
     return 0
 }
 
@@ -340,9 +333,9 @@ generate_event_uid() {
 }
 
 export_calcurse_with_uids() {
-    echo "📤 Esporto i miei eventi con UID in $EXPORT_FILE…"
+   # echo "📤 Esporto i miei eventi con UID in $EXPORT_FILE…"
     local temp_export=$(mktemp)
-    calcurse -D "$CALCURSE_DIR" --export > "$temp_export" || die "Esportazione fallita"
+    calcurse -D "$CALCURSE_DIR" --export > "$temp_export" || die "Export failed"
 
     # Leggi notification.warning dalla configurazione Calcurse
     local notification_warning=""
@@ -391,7 +384,56 @@ export_calcurse_with_uids() {
     done < "$temp_export" > "$EXPORT_FILE"
 
     rm -f "$temp_export"
-    [[ -s "$EXPORT_FILE" ]] && echo "✅ Esportazione con UID completata"
+    [[ -s "$EXPORT_FILE" ]] # && echo "✅ Esportazione con UID completata"
+}
+
+# ----------------------------------------------------------------------
+# FUNZIONE DI NORMALIZZAZIONE RRULE
+# ----------------------------------------------------------------------
+normalize_rrule_for_comparison() {
+    local rrule="$1"
+
+    # Se vuoto, ritorna vuoto
+    [[ -z "$rrule" ]] && return
+
+    # Rimuovi BYMONTH (problema noto)
+    rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
+
+    # Normalizza UNTIL a solo data (ignora orario e Z)
+    rrule=$(echo "$rrule" | sed -E 's/UNTIL=[0-9]{8}T[0-9]{6}Z?/UNTIL=NORM/g')
+
+    # Estrai i componenti e ordina alfabeticamente
+    local freq="" byday="" bymonthday="" bymonth="" until="" interval="" count="" wkst=""
+
+    IFS=';' read -ra components <<< "$rrule"
+    for component in "${components[@]}"; do
+        case "$component" in
+            FREQ=*) freq="$component" ;;
+            BYDAY=*) byday="$component" ;;
+            BYMONTHDAY=*) bymonthday="$component" ;;
+            BYMONTH=*) bymonth="$component" ;;
+            UNTIL=*) until="$component" ;;
+            INTERVAL=*) interval="$component" ;;
+            COUNT=*) count="$component" ;;
+            WKST=*) wkst="$component" ;;
+        esac
+    done
+
+    # Ricostruisci in ordine standard: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH
+    local normalized=""
+    [[ -n "$freq" ]] && normalized="${normalized}${freq};"
+    [[ -n "$interval" ]] && normalized="${normalized}${interval};"
+    [[ -n "$count" ]] && normalized="${normalized}${count};"
+    [[ -n "$until" ]] && normalized="${normalized}${until};"
+    [[ -n "$byday" ]] && normalized="${normalized}${byday};"
+    [[ -n "$bymonthday" ]] && normalized="${normalized}${bymonthday};"
+    [[ -n "$bymonth" ]] && normalized="${normalized}${bymonth};"
+    [[ -n "$wkst" ]] && normalized="${normalized}${wkst};"
+
+    # Rimuovi ultimo ";"
+    normalized="${normalized%;}"
+
+    echo "$normalized"
 }
 
 # ----------------------------------------------------------------------
@@ -438,10 +480,10 @@ find_new_events() {
     local output_file="$3"
 
 
-    echo "🔍 Confronto i file .ics per trovare nuovi eventi…"
+    echo "🔍 Comparing .ics files to find new events… "
 
-    [[ -f "$proton_file" ]]   || die "File Proton non trovato: $proton_file"
-    [[ -f "$calcurse_file" ]] || die "File calcurse non trovato: $calcurse_file"
+    [[ -f "$proton_file" ]]   || die "Proton file not found: $proton_file"
+    [[ -f "$calcurse_file" ]] || die "Calcurse file not found: $calcurse_file"
 
     local proton_tmp=$(mktemp)
     local calcurse_tmp=$(mktemp)
@@ -457,7 +499,7 @@ find_new_events() {
 
     local block="" in_event=0 proton_count=0
 
-    echo "📊 Indicizzazione eventi Proton..."
+    #echo "📊 Indicizzazione eventi Proton..."
 
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
@@ -484,7 +526,7 @@ find_new_events() {
         fi
     done < "$proton_tmp"
 
-    echo "📊 Trovati $proton_count eventi nel file Proton"
+    # echo "📊 Trovati $proton_count eventi nel file Proton"
 
     cat > "$out_tmp" <<EOF
 BEGIN:VCALENDAR
@@ -495,7 +537,7 @@ EOF
     local new_count=0
     block="" in_event=0
 
-    echo "🔍 Ricerca nuovi eventi in Calcurse..."
+   # echo "🔍 Ricerca nuovi eventi in Calcurse..."
 
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
@@ -547,7 +589,7 @@ EOF
                 ((new_count++))
                 local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
                 local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-                echo "➕ Nuovo evento: $summary ($dtstart)"
+                echo "➕ New event: $summary ($dtstart)"
             fi
 
             in_event=0
@@ -562,7 +604,7 @@ EOF
     sed '/^$/d' "$out_tmp" > "$output_file"
     rm -f "$proton_tmp" "$calcurse_tmp" "$out_tmp"
 
-    echo "✅ Trovati $new_count nuovi eventi genuini in $output_file"
+   # echo "✅ Trovati $new_count nuovi eventi genuini in $output_file"
 }
 
 # ----------------------------------------------------------------------
@@ -577,7 +619,7 @@ filter_events_by_date() {
     local current_date=$(date +%Y%m%d)
     local end_date=$(date -d "+${days_future} days" +%Y%m%d)
 
-    echo "📅 Filtro eventi da oggi a $end_date"
+   # echo "📅 Filtro eventi da oggi a $end_date"
 
     local temp_file=$(mktemp)
     local filtered_temp=$(mktemp)
@@ -666,14 +708,14 @@ filter_events_by_date() {
     rm -f "$temp_file" "$filtered_temp"
 
     local filtered_count=$(grep -c "^BEGIN:VEVENT" "$output_file" 2>/dev/null || echo "0")
-    echo "✅ Filtro completato: $filtered_count eventi nell'intervallo selezionato"
+   # echo "✅ Filtro completato: $filtered_count eventi nell'intervallo selezionato"
 }
 
 # ----------------------------------------------------------------------
 # OPZIONE A OTTIMIZZATA
 # ----------------------------------------------------------------------
 option_A() {
-    echo "🔄 SYNC BIDIREZIONALE INTERATTIVA: Calcurse ↔ Proton"
+    echo "🔄 INTERACTIVE BIDIRECTIONAL SYNC: Calcurse ↔ Proton"
 
     export_calcurse_with_uids
 
@@ -736,7 +778,7 @@ option_A() {
    # local sync_report="$BACKUP_DIR/sync-report.txt"
    # > "$sync_report"
 
-    echo "🔍 Analizzo le differenze tra i calendari..."
+   # echo "🔍 Analizzo le differenze tra i calendari..."
 
     local proton_tmp=$(mktemp)
     local calcurse_tmp=$(mktemp)
@@ -747,8 +789,8 @@ option_A() {
     local proton_file_count=$(grep -c "^BEGIN:VEVENT" "$proton_tmp" 2>/dev/null || echo "0")
     local calcurse_file_count=$(grep -c "^BEGIN:VEVENT" "$calcurse_tmp" 2>/dev/null || echo "0")
 
-    echo "📊 File Proton contiene: $proton_file_count eventi"
-    echo "📊 File Calcurse contiene: $calcurse_file_count eventi"
+   # echo "📊 File Proton contiene: $proton_file_count eventi"
+   # echo "📊 File Calcurse contiene: $calcurse_file_count eventi"
 
     # Indicizzazione Proton
     declare -A proton_events
@@ -758,7 +800,7 @@ option_A() {
     local in_event=0
     local proton_count=0
 
-    echo "📊 Indicizzazione eventi Proton..."
+   # echo "📊 Indicizzazione eventi Proton..."
 
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
@@ -768,11 +810,15 @@ option_A() {
             block+=$'\n'"$line"
 
             local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
+            # Normalizza DTSTART: rimuovi TZID e altri parametri, solo data/ora
+            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n' | tr -d 'Z')
             local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n')
 
+            # Normalizza RRULE usando la funzione dedicata
             local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
-            local key="${dtstart}||${rrule}"  # Chiave composta
+            rrule=$(normalize_rrule_for_comparison "$rrule")
+
+            local key="${dtstart}||${rrule}"  # Chiave composta normalizzata
 
             proton_events["$key"]="${summary}||${uid}"
             proton_blocks["$key"]="$block"
@@ -785,7 +831,7 @@ option_A() {
         fi
     done < "$proton_tmp"
 
-    echo "✅ Indicizzati $proton_count eventi da Proton"
+    # echo "✅ Indicizzati $proton_count eventi da Proton"
 
     # Indicizzazione Calcurse
     declare -A calcurse_events
@@ -795,7 +841,7 @@ option_A() {
     in_event=0
     local calcurse_count=0
 
-    echo "📊 Indicizzazione eventi Calcurse..."
+    #echo "📊 Indicizzazione eventi Calcurse..."
 
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
@@ -805,11 +851,15 @@ option_A() {
             block+=$'\n'"$line"
 
             local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
+            # Normalizza DTSTART: rimuovi TZID e altri parametri, solo data/ora
+            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n' | tr -d 'Z')
             local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n')
 
+            # Normalizza RRULE usando la funzione dedicata
             local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
-            local key="${dtstart}||${rrule}"  # Chiave composta
+            rrule=$(normalize_rrule_for_comparison "$rrule")
+
+            local key="${dtstart}||${rrule}"  # Chiave composta normalizzata
 
             calcurse_events["$key"]="${summary}||${uid}"
             calcurse_blocks["$key"]="$block"
@@ -822,7 +872,7 @@ option_A() {
         fi
     done < "$calcurse_tmp"
 
-    echo "✅ Indicizzati $calcurse_count eventi da Calcurse"
+    #echo "✅ Indicizzati $calcurse_count eventi da Calcurse"
     echo ""
 
     # Array per tracciare le decisioni
@@ -832,7 +882,7 @@ option_A() {
 
     # Confronto: eventi in Proton ma non in Calcurse
     local proton_only_count=0
-    echo "🔍 Verifico eventi presenti solo in Proton..."
+    echo "🔍 Checking events present only in Proton..."
 
     for key in "${!proton_events[@]}"; do
         if [[ -z "${calcurse_events[$key]}" ]]; then
@@ -841,18 +891,18 @@ option_A() {
 
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📍 Evento #$proton_only_count presente in Proton ma non in Calcurse:"
-            echo "   📝 Titolo: ${summary:-[Senza titolo]}"
-            echo "   📅 Data/Ora: $key"
+            echo "📍 Event #$proton_only_count present in Proton but not in Calcurse:"
+            echo "   📝 Title: ${summary:-[Senza titolo]}"
+            echo "   📅 Date/Time: $key"
             echo "   🆔 UID: $uid"
             echo ""
-            read -rp "   ➡️  Vuoi importarlo in Calcurse? (y/N): " import_choice
+            read -rp "   ➡️  Do you want to import it into Calcurse? (y/N): " import_choice
 
             if [[ "$import_choice" =~ ^[sSyY]$ ]]; then
                 events_to_import_to_calcurse+=("$key")
-                echo "   ✅ Verrà importato in Calcurse"
+                echo "   ✅ It will be imported in Calcurse"
             else
-                echo "   ⏭️  Saltato (rimane solo in Proton)"
+                echo "   ⏭️  Skipped (remains only in Proton)"
             fi
         fi
     done
@@ -860,7 +910,7 @@ option_A() {
     # Confronto: eventi in Calcurse ma non in Proton
     local calcurse_only_count=0
     echo ""
-    echo "🔍 Verifico eventi presenti solo in Calcurse..."
+    #echo "🔍 Verifico eventi presenti solo in Calcurse..."
 
     for key in "${!calcurse_events[@]}"; do
         if [[ -z "${proton_events[$key]}" ]]; then
@@ -869,29 +919,29 @@ option_A() {
 
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📍 Evento #$calcurse_only_count presente in Calcurse ma non in Proton:"
-            echo "   📝 Titolo: ${summary:-[Senza titolo]}"
-            echo "   📅 Data/Ora: $key"
+            echo "📍 Event #$calcurse_only_count present in Calcurse but not in Proton:"
+            echo "   📝 Title: ${summary:-[Senza titolo]}"
+            echo "   📅 Date/Time: $key"
             echo "   🆔 UID: $uid"
             echo ""
-            echo "   Cosa vuoi fare?"
-            echo "   A) 🗑️  Eliminalo da Calcurse (era già stato cancellato in Proton)"
-            echo "   B) ➕ Mantienilo e aggiungilo a Proton"
-            echo "   C) ⏭️  Salta (lascia com'è, nessuna modifica)"
+            echo "   What do you want to do?"
+            echo "   A) 🗑️  Delete it from Calcurse (it was already deleted in Proton)"
+            echo "   B) ➕ Keep it and add it to Proton"
+            echo "   C) ⏭️  Skip (leave as is, no changes)"
             echo ""
-            read -rp "   Scelta (A/B/C): " choice
+            read -rp "   Choice (A/B/C): " choice
 
             case "${choice^^}" in
                 A)
                     events_to_delete_from_calcurse+=("$key")
-                    echo "   ✅ Verrà eliminato da Calcurse"
+                    echo "   ✅ It will be deleted from Calcurse"
                     ;;
                 B)
                     events_to_export_to_proton+=("$key")
-                    echo "   ✅ Verrà aggiunto a Proton"
+                    echo "   ✅ It will be added to Proton"
                     ;;
                 *)
-                    echo "   ⏭️  Saltato (nessuna modifica)"
+                  echo "   ⏭️  Skipped (no changes)"
                     ;;
             esac
         fi
@@ -905,16 +955,16 @@ option_A() {
     if [[ ${#events_to_import_to_calcurse[@]} -eq 0 ]] && \
        [[ ${#events_to_delete_from_calcurse[@]} -eq 0 ]] && \
        [[ ${#events_to_export_to_proton[@]} -eq 0 ]]; then
-        echo "✅ Nessuna modifica da applicare. I calendari sono allineati!"
+        echo "✅ No changes to apply. The calendars are synchronized!"
         rm -f "$proton_tmp" "$calcurse_tmp"
         return 0
     fi
 
-    echo "📋 RIEPILOGO MODIFICHE:"
+    echo "📋 Summary of changes:"
     echo ""
 
     if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
-        echo "📥 Eventi da importare in Calcurse: ${#events_to_import_to_calcurse[@]}"
+        echo "📥 Events to import into Calcurse: ${#events_to_import_to_calcurse[@]}"
         for key in "${events_to_import_to_calcurse[@]}"; do
             IFS='||' read -r summary uid <<< "${proton_events[$key]}"
             local dtstart_display="${key%%::*}"
@@ -924,7 +974,7 @@ option_A() {
     fi
 
     if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
-        echo "🗑️  Eventi da eliminare da Calcurse: ${#events_to_delete_from_calcurse[@]}"
+        echo "🗑️  Events to delete from Calcurse: ${#events_to_delete_from_calcurse[@]}"
         for key in "${events_to_delete_from_calcurse[@]}"; do
             IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
             local dtstart_display="${key%%::*}"
@@ -934,7 +984,7 @@ option_A() {
     fi
 
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
-        echo "📤 Eventi da esportare verso Proton: ${#events_to_export_to_proton[@]}"
+        echo "📤 Events to export to Proton: ${#events_to_export_to_proton[@]}"
         for key in "${events_to_export_to_proton[@]}"; do
             IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
             local dtstart_display="${key%%::*}"
@@ -943,24 +993,24 @@ option_A() {
         echo ""
     fi
 
-    read -rp "Confermi l'applicazione di queste modifiche? (y/N): " confirm
+    read -rp "Do you confirm applying these changes? (y/N): " confirm
 
     if [[ ! "$confirm" =~ ^[sSyY]$ ]]; then
-        echo "❌ Operazione annullata dall'utente"
+        echo "❌ Operation cancelled by the user"
         rm -f "$proton_tmp" "$calcurse_tmp"
         return 1
     fi
 
     # Backup prima delle modifiche
     echo ""
-    echo "💾 Creo backup di sicurezza..."
-    calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup fallito"
-    echo "✅ Backup salvato: $BACKUP_FILE"
+    echo "💾 Creating backup..."
+    calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup failed"
+    echo "✅ Backup saved: $BACKUP_FILE"
 
     # FASE 1: Importa eventi da Proton a Calcurse
     if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
         echo ""
-        echo "📥 Importo ${#events_to_import_to_calcurse[@]} eventi da Proton a Calcurse..."
+        echo "📥 Importing ${#events_to_import_to_calcurse[@]} events form Proton to Calcurse..."
 
         local import_temp=$(mktemp)
         echo "BEGIN:VCALENDAR" > "$import_temp"
@@ -974,15 +1024,15 @@ option_A() {
 
         echo "END:VCALENDAR" >> "$import_temp"
 
-        calcurse -D "$CALCURSE_DIR" -i "$import_temp" || die "Importazione fallita"
+        calcurse -D "$CALCURSE_DIR" -i "$import_temp" || die "Import failed"
         rm -f "$import_temp"
-        echo "✅ Importazione completata"
+        echo "✅ Import completed"
     fi
 
     # FASE 2: Elimina eventi da Calcurse (tramite re-import filtrato)
 if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     echo ""
-    echo "🗑️  Elimino ${#events_to_delete_from_calcurse[@]} eventi da Calcurse..."
+    echo "🗑️  Deleting ${#events_to_delete_from_calcurse[@]} events from Calcurse..."
 
     declare -A to_delete
     #echo "DEBUG: Chiavi da eliminare:"
@@ -1025,10 +1075,10 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
             if [[ -z "${to_delete[$key]}" ]]; then
                 echo "$block" >> "$filtered_temp"
                 ((kept_count++))
-                echo "  -> MANTENUTO"
+                #echo "  -> MANTENUTO"
             else
                 ((deleted_count++))
-                echo "  -> ELIMINATO"
+                #echo "  -> ELIMINATO"
             fi
 
             in_event=0
@@ -1041,10 +1091,10 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     echo "END:VCALENDAR" >> "$filtered_temp"
 
     echo ""
-    echo "DEBUG: Riepilogo processamento:"
-    echo "  - Eventi totali processati: $event_count"
-    echo "  - Eventi mantenuti: $kept_count"
-    echo "  - Eventi eliminati: $deleted_count"
+    echo "Processing summary:"
+    echo "  - Total events processed: $event_count"
+    echo "  - Events kept: $kept_count"
+    echo "  - Events deleted: $deleted_count"
     echo ""
 
     # SVUOTA COMPLETAMENTE la directory Calcurse
@@ -1054,13 +1104,13 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     calcurse -D "$CALCURSE_DIR" -i "$filtered_temp" || die "Eliminazione fallita"
 
     rm -f "$current_export" "$filtered_temp"
-    echo "✅ Eliminazione completata"
+    echo "✅ Deletion completed"
 fi
 
     # FASE 3: Genera file per export a Proton
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
         echo ""
-        echo "📤 Genero file per importazione in Proton..."
+        echo "📤 Generating file for import into Proton..."
 
         echo "BEGIN:VCALENDAR" > "$NEW_EVENTS_FILE"
         echo "VERSION:2.0" >> "$NEW_EVENTS_FILE"
@@ -1093,14 +1143,14 @@ fi
         echo "END:VCALENDAR" >> "$NEW_EVENTS_FILE"
         sed -i '/^$/d' "$NEW_EVENTS_FILE"
 
-        echo "✅ File generato: $NEW_EVENTS_FILE"
-        echo "   📌 Importa questo file manualmente in Proton Calendar"
+        echo "✅ File generated: $NEW_EVENTS_FILE"
+        echo "   📌 Please manually import this file into  Proton Calendar"
     fi
 
     # Aggiorna export
     if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]] || [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
         echo ""
-        echo "🔄 Aggiorno export di Calcurse..."
+        echo "🔄 Updating Calcurse export..."
         export_calcurse_with_uids
     fi
 
@@ -1110,15 +1160,15 @@ fi
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "✅ SINCRONIZZAZIONE COMPLETATA!"
+    echo "✅ SYNCRONIZATION COMPLETED!"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    echo "📊 Riepilogo:"
-    echo "   • Eventi importati in Calcurse: ${#events_to_import_to_calcurse[@]}"
-    echo "   • Eventi eliminati da Calcurse: ${#events_to_delete_from_calcurse[@]}"
-    echo "   • Eventi da importare in Proton: ${#events_to_export_to_proton[@]}"
+    echo "📊 Summary:"
+    echo "   • Events imported into Calcurse: ${#events_to_import_to_calcurse[@]}"
+    echo "   • Events deleted from Calcurse: ${#events_to_delete_from_calcurse[@]}"
+    echo "   • Events to import into Proton: ${#events_to_export_to_proton[@]}"
     echo ""
-    echo "💾 Backup disponibile: $BACKUP_FILE"
+    echo "💾 Backup available: $BACKUP_FILE"
 }
 
 
@@ -1176,9 +1226,9 @@ option_B() {
 
     local proton_file="$IMPORT_FILE"
 
-    echo "📄 Trovato: $(basename "$proton_file")"
+    #echo "📄 Trovato: $(basename "$proton_file")"
 
-    echo "💾 Backup in $BACKUP_FILE..."
+    #echo "💾 Backup in $BACKUP_FILE..."
     calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup fallito"
 
     local current_calcurse_export=$(mktemp)
@@ -1186,7 +1236,7 @@ option_B() {
     cp "$EXPORT_FILE" "$current_calcurse_export"
 
     local proton_file_normalized=$(mktemp)
-    echo "📄 Normalizzo i promemoria per Calcurse..."
+   # echo "📄 Normalizzo i promemoria per Calcurse..."
 
     {
         local in_event=0
@@ -1209,7 +1259,7 @@ option_B() {
         done < "$proton_file"
     } > "$proton_file_normalized"
 
-    echo "📄 Cerco nuovi eventi da Proton da importare in Calcurse..."
+   # echo "📄 Cerco nuovi eventi da Proton da importare in Calcurse..."
 
     local new_events_for_calcurse=$(mktemp)
     local proton_tmp=$(mktemp)
@@ -1289,7 +1339,7 @@ option_B() {
                 ((import_count++))
                 local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
                 local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-                echo "➕ Nuovo evento da importare: $summary ($dtstart)"
+                echo "➕ New event to import: $summary ($dtstart)"
             fi
 
             in_event=0
@@ -1302,23 +1352,23 @@ option_B() {
     echo "END:VCALENDAR" >> "$new_events_for_calcurse"
 
     if [[ $import_count -gt 0 ]]; then
-        echo "📥 Importo $import_count nuovi eventi da Proton a Calcurse…"
-        calcurse -D "$CALCURSE_DIR" -i "$new_events_for_calcurse" || die "Importazione fallita"
+        echo "📥 Importing $import_count new events from Proton to Calcurse…"
+        calcurse -D "$CALCURSE_DIR" -i "$new_events_for_calcurse" || die "Import failed"
 
-        echo "📄 Aggiorno il file di export con i nuovi eventi importati..."
+    #    echo "📄 Aggiorno il file di export con i nuovi eventi importati..."
         export_calcurse_with_uids
     else
-        echo "✅ Nessun nuovo evento da importare da Proton"
+        echo "✅ No new events to import from Proton"
     fi
 
     rm -f "$proton_file_normalized" "$current_calcurse_export" "$new_events_for_calcurse" "$proton_tmp" "$calcurse_tmp"
 
     clean_old_backups
 
-    echo "✅ Importazione completata! Eventi aggiornati da Proton (merge)."
-    echo "📂 Backup salvato: $BACKUP_FILE"
-    echo "📂 Export aggiornato: $EXPORT_FILE"
-    echo "📊 Eventi importati: $import_count"
+    echo "✅ Import completed! Events updated from Proton (merge)."
+    echo "📂 Backup saved: $BACKUP_FILE"
+    echo "📂 Export updated: $EXPORT_FILE"
+    echo "📊 Events imported: $import_count"
 }
 
 option_C() {
@@ -1333,7 +1383,7 @@ option_C() {
     find_new_events "$IMPORT_FILE" "$EXPORT_FILE" "$NEW_EVENTS_FILE"
      # Salva timestamp DOPO export riuscito
     save_export_timestamp
-    echo "📂 File per Proton: $NEW_EVENTS_FILE"
+    echo "📂 File for Proton: $NEW_EVENTS_FILE"
 }
 
 option_D() {
@@ -1356,7 +1406,7 @@ option_D() {
 
     rm -f "$proton_filtered" "$calcurse_filtered"
     save_export_timestamp
-    echo "📂 File per Proton (solo eventi futuri): $NEW_EVENTS_FILE"
+    echo "📂 File for Proton (future events only): $NEW_EVENTS_FILE"
 }
 
 option_E() {
@@ -1381,7 +1431,7 @@ option_E() {
 
     rm -f "$proton_filtered" "$calcurse_filtered"
     save_export_timestamp
-    echo "📂 File per Proton (prossimi $days_future giorni): $NEW_EVENTS_FILE"
+    echo "📂 File for Proton (next $days_future days): $NEW_EVENTS_FILE"
 }
 
 option_F() {
@@ -1398,19 +1448,19 @@ option_F() {
     find_and_prepare_proton_file
 
     echo "💾 Backup in $BACKUP_FILE..."
-    calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup fallito"
+    calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup failed"
 
-    echo "🗑️ Svuoto Calcurse..."
+    echo "🗑️ Emptying Calcurse..."
     > "$CALCURSE_DIR/apts"
 
-    echo "📥 Importo tutto da Proton..."
-    calcurse -D "$CALCURSE_DIR" -i "$IMPORT_FILE" || die "Importazione fallita"
+    echo "📥 Importing everything from Proton..."
+    calcurse -D "$CALCURSE_DIR" -i "$IMPORT_FILE" || die "Import failed"
 
     export_calcurse_with_uids
     clean_old_backups
 
-    echo "✅ Sincronizzazione completa completata!"
-    echo "📂 Backup salvato: $BACKUP_FILE"
+    echo "✅ Complete synchronization completed!"
+    echo "📂 Backup saved: $BACKUP_FILE"
 }
 
 echo "🔔 REMEMBER: Make sure you have downloaded the UPDATED file from Proton Calendar"
