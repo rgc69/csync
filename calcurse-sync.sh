@@ -882,7 +882,7 @@ option_A() {
 
     # Confronto: eventi in Proton ma non in Calcurse
     local proton_only_count=0
-    echo "🔍 Checking events present only in Proton..."
+    #echo "🔍 Checking events present only in Proton..."
 
     for key in "${!proton_events[@]}"; do
         if [[ -z "${calcurse_events[$key]}" ]]; then

@@ -36,7 +36,7 @@ mkdir -p ~/Projects/calendar
 cd ~/Projects/calendar
 
 # Download the sync script
-wget -O calcurse-sync.sh https://codeberg.org/rgc/csync.git
+wget -O calcurse-sync.sh https://github.com/rgc69/csync.git
 chmod +x calcurse-sync.sh
 ```
 
@@ -156,9 +156,18 @@ Additionally, **export operations (C/D/E) include smart caching**: the script tr
 
 Events are matched using:
 1. **Composite primary key**: `DTSTART + RRULE` (handles recurring events correctly)
+   - **DTSTART normalization**: Removes timezone info and parameters for consistent comparison
+   - **RRULE normalization**: Components are sorted in standard order (FREQ → INTERVAL → COUNT → UNTIL → BYDAY → etc.)
+   - **UNTIL normalization**: Different timestamp formats are normalized (e.g., `20251020T115000` and `20251020T215959Z` both become `UNTIL=NORM`)
 2. **Stored metadata**: Summary and UID for display and verification
 3. **Alarm normalization**: Reminders rounded to 5-minute intervals for comparison
 4. **RRULE cleaning**: Automatically removes unsupported rules (e.g., `BYMONTH` in weekly recurrences)
+
+**Why normalization matters**: Proton and Calcurse represent the same recurring event with slightly different formats:
+- Proton might use `FREQ=WEEKLY;BYDAY=TU,TH;UNTIL=20251020T215959Z`
+- Calcurse might use `FREQ=WEEKLY;UNTIL=20251020T115000;BYDAY=TU,TH`
+
+The normalization ensures both are recognized as the same event.
 
 ### Alarm Conversion
 
@@ -190,6 +199,16 @@ Events are matched using:
 
 - **Calcurse data:** `~/.local/share/calcurse/` or `~/.calcurse/`
 - **Script directory:** `~/Projects/calendar/` (configurable)
+
+## 🆕 Recent Improvements
+
+### v1.1 - Enhanced Event Matching
+- **Fixed duplicate event detection**: Events that are identical in both calendars are now correctly recognized
+- **RRULE normalization**: Components are sorted alphabetically to handle different ordering between Proton and Calcurse
+- **DTSTART normalization**: Timezone parameters are stripped for consistent comparison
+- **UNTIL normalization**: Different timestamp formats in recurring events are now matched correctly
+
+**Impact**: Eliminates false positives where the same event appeared as "missing" in both calendars during interactive sync.
 
 ## 🤝 Contributing
 
