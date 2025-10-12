@@ -1482,6 +1482,20 @@ option_B() {
 
 option_C() {
     echo "➡️ Export events to Proton"
+    echo ""
+    echo "⚠️  WARNING: This option is intended for INITIAL MIGRATION only!"
+    echo "    • First time moving from Calcurse to Proton: ✅ Safe"
+    echo "    • Already synced before: ❌ Will create DUPLICATES"
+    echo "    • Modified recurring events (EXDATE): ❌ NOT handled"
+    echo ""
+    echo "    💡 For regular sync, use Option A (Interactive Sync) instead."
+    echo ""
+    read -rp "    Is this your FIRST export to Proton? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+        echo "❌ Export cancelled. Use Option A for regular synchronization."
+        return 1
+    fi
+    echo ""
     export_calcurse_with_uids
     # Check if Calcurse is changed
     if ! check_if_export_needed; then
@@ -1497,6 +1511,21 @@ option_C() {
 
 option_D() {
     echo "➡️ Export future events only (30 days)"
+    echo ""
+    echo "⚠️  WARNING: Same limitations as Option C:"
+    echo "    • Intended for INITIAL/PARTIAL migration only"
+    echo "    • Will create duplicates if events already in Proton"
+    echo "    • Does NOT handle EXDATE modifications"
+    echo "    • Filters to next 30 days only"
+    echo ""
+    echo "    💡 For regular sync, use Option A instead."
+    echo ""
+    read -rp "    Continue with filtered export? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+        echo "❌ Export cancelled."
+        return 1
+    fi
+    echo ""
     export_calcurse_with_uids
     # Check if Calcurse is changed
     if ! check_if_export_needed; then
@@ -1520,8 +1549,23 @@ option_D() {
 
 option_E() {
     echo "➡️ Export with custom interval"
+    echo ""
+    echo "⚠️  WARNING: Same limitations as Option C/D:"
+    echo "    • Intended for INITIAL/PARTIAL migration only"
+    echo "    • Will create duplicates if events already in Proton"
+    echo "    • Does NOT handle EXDATE modifications"
+    echo ""
+    echo "    💡 For regular sync, use Option A instead."
+    echo ""
+    read -rp "    Continue with custom export? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+        echo "❌ Export cancelled."
+        return 1
+    fi
+    
     read -rp "Days in the future to include (default: 90): " days_future
     days_future=${days_future:-90}
+    echo ""
 
     export_calcurse_with_uids
     if ! check_if_export_needed; then

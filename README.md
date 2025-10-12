@@ -106,32 +106,63 @@ Q) ❌ Exit without operations
 
 ### Understanding Each Sync Option
 
-#### 🎯 **Option A - Interactive Bidirectional Sync** ⭐ RECOMMENDED
+> **💡 TL;DR - What Should I Use?**
+> - **Daily use:** Option A (Interactive Sync) - handles everything correctly
+> - **First time setup:** Option F (Complete Replacement) or Option A
+> - **Reset/problems:** Option F (Complete Replacement)
+> - **Options C/D/E:** ⚠️ Only for initial migration, then use A
+
+---
+
+#### 🎯 **Option A - Interactive Bidirectional Sync** ⭐ **RECOMMENDED FOR EVERYONE**
+
 The most complete and safest synchronization method:
 - ✅ Detects events missing in either calendar
 - ✅ **Handles recurring event exclusions (EXDATE)**
 - ✅ Detects when you delete a single occurrence of a recurring event
 - ✅ Interactive: you decide what to do with each discrepancy
 - ✅ Creates backup before making changes
+- ✅ Bidirectional: works both ways (Proton ↔ Calcurse)
+- ✅ Smart: prevents duplicates even with different UIDs
 
-**Use this when:**
-- You want full control over synchronization
-- You've deleted single occurrences of recurring events
-- You want to see exactly what will change
+**Use this for:**
+- ✅ Daily/weekly synchronization
+- ✅ After modifying events in either calendar
+- ✅ When you want to see exactly what will change
+- ✅ When you've deleted occurrences of recurring events
+- ✅ 99% of your sync needs
 
 **EXDATE handling:** ✅ **Full support** - detects and lets you resolve differences
 
+**Example workflow:**
+```bash
+# Every day/week:
+1. Download fresh calendar from Proton
+2. Run: ./calcurse-sync.sh → Choose A
+3. Review changes → Confirm
+4. Import generated file to Proton (if needed)
+```
+
 ---
 
-#### 📥 **Option B - Import from Proton (merge)**
+#### 📥 **Option B - Import from Proton (batch merge)**
+
 Quick batch import of new events from Proton to Calcurse:
-- ✅ Imports new events not present in Calcurse
+- ✅ Fast: imports new events without interaction
+- ✅ Safe: doesn't delete anything from Calcurse
 - ❌ Does NOT update existing events
 - ❌ **Does NOT handle EXDATE changes** (won't sync deleted occurrences)
+- ❌ May create duplicates if UIDs don't match
 
-**Use this when:**
-- You've added events in Proton and want to import them quickly
-- You haven't modified existing recurring events
+**Use this for:**
+- 📅 You added many new events in Proton web and want quick import
+- 🎫 You imported an external calendar into Proton (concerts, holidays)
+- 🔄 First-time import of a new Proton calendar
+
+**Don't use this for:**
+- ❌ Regular synchronization (use A instead)
+- ❌ When you've modified recurring events (use A instead)
+- ❌ When you've deleted event occurrences (use A instead)
 
 **EXDATE handling:** ❌ **Not supported** - use Option A if you deleted occurrences
 
@@ -142,35 +173,69 @@ csync # Choose option B
 
 ---
 
-#### 📤 **Options C/D/E - Export to Proton**
+#### 📤 **Options C/D/E - Export to Proton** ⚠️ **USE ONLY ONCE**
+
 Generate a file to import into Proton Calendar:
-- ✅ Exports new events not present in Proton
-- ✅ Option D/E: filter by date range
+- ✅ Exports events from Calcurse to a .ics file
+- ✅ Option D: filters to next 30 days
+- ✅ Option E: custom date range
 - ❌ Does NOT update existing events
 - ❌ **Does NOT handle EXDATE changes**
+- ❌ **Creates DUPLICATES if you've synced before** (Proton changes UIDs on import)
 
-**Use this when:**
-- You've added events in Calcurse and want to export them
-- You haven't modified existing recurring events
+**⚠️ CRITICAL WARNING:**
+These options are designed for **ONE-TIME INITIAL MIGRATION** only. If you've already synced events to Proton before, using these options again will create duplicates because Proton assigns new UIDs when importing.
 
-**EXDATE handling:** ❌ **Not supported** - use Option A if you deleted occurrences
+**Use these ONLY for:**
+- 🆕 **First time:** Moving all your Calcurse events to a new Proton calendar
+- 🔄 **Migration:** Switching from another system to Proton
+- 📊 **Export/backup:** Creating a .ics file for external use
+
+**After initial migration, ALWAYS use Option A for synchronization.**
+
+**EXDATE handling:** ❌ **Not supported** - use Option A for recurring events
+
+**Why duplicates happen:**
+```
+First sync:
+  Calcurse event: UID=CALCURSE-abc123@hostname
+  Export to Proton → Proton assigns new UID=xyz789@proton.me
+  
+Second sync (using C/D/E):
+  Calcurse still has: UID=CALCURSE-abc123@hostname
+  Script thinks it's a new event → Exports again
+  Proton assigns another new UID → DUPLICATE ❌
+  
+Solution: Use Option A - it matches by content, not just UID ✅
+```
 
 ```bash
-csync # Choose option C (all events), D (future events), or E (custom range)
-# Generates a file to import into Proton Calendar manually
+# ONLY for first-time migration:
+csync # Choose option C (all events), D (30 days), or E (custom range)
+# After this, ALWAYS use Option A
 ```
 
 ---
 
-#### 🔄 **Option F - Complete Replacement**
-⚠️ **CAUTION**: Replaces ALL Calcurse content with Proton:
-- ✅ Perfect one-way sync from Proton
-- ✅ Handles EXDATE correctly (by replacing everything)
-- ❌ **DELETES everything** not in Proton
+#### 🔄 **Option F - Complete Replacement** ⚠️ **DESTRUCTIVE**
 
-**Use this when:**
-- You want Calcurse to be an exact copy of Proton
-- You're okay losing Calcurse-only events
+Replaces ALL Calcurse content with Proton (one-way sync):
+- ✅ Perfect one-way sync: Calcurse becomes exact copy of Proton
+- ✅ Handles EXDATE correctly (by replacing everything)
+- ✅ Fast: no interaction needed
+- ✅ Clean: no duplicates, no conflicts
+- ❌ **DELETES everything in Calcurse not in Proton**
+- ❌ One-way only: Proton → Calcurse
+
+**Use this for:**
+- 🔄 **Proton is master:** You only edit in Proton web, use Calcurse for viewing
+- 🆕 **First time setup:** Initial population of Calcurse from Proton
+- 🐛 **Reset after problems:** Calcurse got corrupted, start fresh
+- 🔧 **Regular workflow:** You prefer Proton web and want terminal read-only access
+
+**Don't use this if:**
+- ❌ You add/edit events in Calcurse (they'll be lost)
+- ❌ You want bidirectional sync (use A instead)
 
 **EXDATE handling:** ✅ **Works** (by complete replacement)
 
@@ -181,17 +246,123 @@ csync # Choose option F
 
 ---
 
-### 💡 Best Practice Workflow
+### 💡 Recommended Workflows
 
-**For day-to-day synchronization:**
-1. Download fresh calendar from Proton (Settings → Export)
-2. Run **Option A** (Interactive Bidirectional Sync)
-3. Review and confirm each change
-4. Import generated file into Proton if needed
+#### **Workflow 1: Bidirectional Sync (Most Common)** ⭐
 
-**For recurring events with deleted occurrences:**
-- ⭐ **Always use Option A** - it's the only option that properly handles EXDATE differences
-- Example: If you skip the October meeting of a monthly event, only Option A will sync that deletion correctly
+You use both Proton Calendar and Calcurse actively.
+
+```bash
+# Every few days:
+1. Download fresh "My Calendar-YYYY-MM-DD.ics" from Proton
+2. ./calcurse-sync.sh → Option A
+3. Review and confirm changes
+4. Import generated file to Proton (if needed)
+```
+
+**Benefits:**
+- ✅ Full control over changes
+- ✅ Handles deleted occurrences correctly
+- ✅ No duplicates
+- ✅ Safe and reversible
+
+---
+
+#### **Workflow 2: Proton Master (One-Way)**
+
+You only edit in Proton web, use Calcurse for terminal viewing.
+
+```bash
+# Weekly:
+1. Download fresh calendar from Proton
+2. ./calcurse-sync.sh → Option F
+3. Done! Calcurse is updated
+```
+
+**Benefits:**
+- ✅ Very fast (no interaction)
+- ✅ Calcurse always matches Proton exactly
+- ✅ Simple workflow
+
+**Warning:** Any events added in Calcurse will be deleted!
+
+---
+
+#### **Workflow 3: Initial Setup**
+
+First time using the script.
+
+```bash
+# Option A (Recommended - gives you control):
+1. Download Proton calendar
+2. ./calcurse-sync.sh → Option A
+3. Review what will be added/removed
+4. Confirm changes
+
+# OR Option F (Faster - if Proton has all events):
+1. Download Proton calendar
+2. ./calcurse-sync.sh → Option F
+3. Calcurse now matches Proton
+
+# After initial setup, always use Option A or F based on your workflow
+```
+
+---
+
+### ⚠️ Common Mistakes to Avoid
+
+**❌ Using Option C/D/E repeatedly:**
+```bash
+# Day 1: Export with Option C → Import to Proton ✅
+# Day 2: Export with Option C again → DUPLICATES ❌
+
+# Solution: Use Option A after initial migration ✅
+```
+
+**❌ Using Option B for recurring event changes:**
+```bash
+# You delete Oct 15 occurrence in Proton
+# Option B → Doesn't import the deletion ❌
+# Calcurse still shows Oct 15
+
+# Solution: Use Option A - it detects EXDATE changes ✅
+```
+
+**❌ Using Option F with a bidirectional workflow:**
+```bash
+# You add events in Calcurse
+# Option F → All your Calcurse events deleted ❌
+
+# Solution: Use Option A for bidirectional sync ✅
+```
+
+---
+
+### 📊 Quick Reference Table
+
+| Option | Use Case | EXDATE Support | Duplicates Risk | Best For |
+|--------|----------|----------------|-----------------|----------|
+| **A** | Daily sync | ✅ Full | ❌ No | Everyone (99% of use) |
+| **B** | Batch import | ❌ None | ⚠️ Possible | External calendar import |
+| **C/D/E** | Export | ❌ None | ⚠️ High | One-time migration only |
+| **F** | Replace all | ✅ Works | ❌ No | One-way sync, reset |
+
+---
+
+### 🎯 Final Recommendation
+
+**For most users:**
+- Use **Option A** for all synchronization needs
+- It handles everything correctly: new events, deletions, EXDATE changes
+- Takes a bit longer but prevents all problems
+
+**For Proton-primary users:**
+- Use **Option F** for one-way sync (Proton → Calcurse)
+- Faster but only if you never edit in Calcurse
+
+**Avoid:**
+- Using C/D/E more than once (creates duplicates)
+- Using B for recurring event changes (doesn't handle EXDATE)
 
 ## ⚙️ File Structure
 
