@@ -7,6 +7,7 @@ A bash script for manual bidirectional synchronization of events between **Proto
 ## ✨ Features
 
 - 🔄 **Interactive Bidirectional Sync** - Main workflow with guided decision-making for each discrepancy
+- 🎯 **Smart Recurring Event Handling** - Detects and manages exclusions (EXDATE) in recurring events
 - 🚀 **Optimized Performance** - Uses hash-based comparisons (O(n) complexity) instead of nested loops
 - 🚨 **Smart Alarm Conversion** - Normalizes reminders between systems
 - 📅 **Flexible Time Ranges** - Sync all events or just future ones
@@ -103,25 +104,94 @@ F) 🔄 COMPLETE SYNC: Proton → Calcurse (REPLACES everything)
 Q) ❌ Exit without operations
 ```
 
-### Alternative Workflows
+### Understanding Each Sync Option
 
-**For batch import from Proton (Option B):**
+#### 🎯 **Option A - Interactive Bidirectional Sync** ⭐ RECOMMENDED
+The most complete and safest synchronization method:
+- ✅ Detects events missing in either calendar
+- ✅ **Handles recurring event exclusions (EXDATE)**
+- ✅ Detects when you delete a single occurrence of a recurring event
+- ✅ Interactive: you decide what to do with each discrepancy
+- ✅ Creates backup before making changes
+
+**Use this when:**
+- You want full control over synchronization
+- You've deleted single occurrences of recurring events
+- You want to see exactly what will change
+
+**EXDATE handling:** ✅ **Full support** - detects and lets you resolve differences
+
+---
+
+#### 📥 **Option B - Import from Proton (merge)**
+Quick batch import of new events from Proton to Calcurse:
+- ✅ Imports new events not present in Calcurse
+- ❌ Does NOT update existing events
+- ❌ **Does NOT handle EXDATE changes** (won't sync deleted occurrences)
+
+**Use this when:**
+- You've added events in Proton and want to import them quickly
+- You haven't modified existing recurring events
+
+**EXDATE handling:** ❌ **Not supported** - use Option A if you deleted occurrences
+
 ```bash
 csync # Choose option B
 # Imports all new events from Proton to Calcurse without interaction
 ```
 
-**For exporting new Calcurse events (Options C/D/E):**
+---
+
+#### 📤 **Options C/D/E - Export to Proton**
+Generate a file to import into Proton Calendar:
+- ✅ Exports new events not present in Proton
+- ✅ Option D/E: filter by date range
+- ❌ Does NOT update existing events
+- ❌ **Does NOT handle EXDATE changes**
+
+**Use this when:**
+- You've added events in Calcurse and want to export them
+- You haven't modified existing recurring events
+
+**EXDATE handling:** ❌ **Not supported** - use Option A if you deleted occurrences
+
 ```bash
 csync # Choose option C (all events), D (future events), or E (custom range)
 # Generates a file to import into Proton Calendar manually
 ```
 
-**For complete replacement (Option F - CAUTION):**
+---
+
+#### 🔄 **Option F - Complete Replacement**
+⚠️ **CAUTION**: Replaces ALL Calcurse content with Proton:
+- ✅ Perfect one-way sync from Proton
+- ✅ Handles EXDATE correctly (by replacing everything)
+- ❌ **DELETES everything** not in Proton
+
+**Use this when:**
+- You want Calcurse to be an exact copy of Proton
+- You're okay losing Calcurse-only events
+
+**EXDATE handling:** ✅ **Works** (by complete replacement)
+
 ```bash
 csync # Choose option F
 # Completely replaces Calcurse with Proton content (creates backup first)
 ```
+
+---
+
+### 💡 Best Practice Workflow
+
+**For day-to-day synchronization:**
+1. Download fresh calendar from Proton (Settings → Export)
+2. Run **Option A** (Interactive Bidirectional Sync)
+3. Review and confirm each change
+4. Import generated file into Proton if needed
+
+**For recurring events with deleted occurrences:**
+- ⭐ **Always use Option A** - it's the only option that properly handles EXDATE differences
+- Example: If you skip the October meeting of a monthly event, only Option A will sync that deletion correctly
 
 ## ⚙️ File Structure
 
@@ -201,6 +271,21 @@ The normalization ensures both are recognized as the same event.
 - **Script directory:** `~/Projects/calendar/` (configurable)
 
 ## 🆕 Recent Improvements
+
+### v1.2 - EXDATE Detection for Recurring Events
+- **Smart exclusion detection**: The script now detects when the same recurring event has different exclusions (EXDATE) between Proton and Calcurse
+- **Interactive resolution**: When exclusions differ, you can choose which version to keep:
+  - Use Proton's exclusions (update Calcurse)
+  - Use Calcurse's exclusions (update Proton)
+  - Skip and leave both as is
+- **Common use case**: If you delete a single occurrence of a recurring event in Proton, the script will now correctly detect that Calcurse still has that occurrence and ask you what to do
+
+**Example scenario:**
+- You have a monthly recurring event "Recharge Vodafone" starting Jan 15, 2023
+- You delete the October 15, 2025 occurrence in Proton
+- Proton adds `EXDATE:20251015T100000` to the event
+- Calcurse still has all occurrences
+- The script detects the difference and asks if you want to sync the deletion
 
 ### v1.1 - Enhanced Event Matching
 - **Fixed duplicate event detection**: Events that are identical in both calendars are now correctly recognized

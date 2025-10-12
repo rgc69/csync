@@ -392,19 +392,19 @@ export_calcurse_with_uids() {
 # ----------------------------------------------------------------------
 normalize_rrule_for_comparison() {
     local rrule="$1"
-
+    
     # Se vuoto, ritorna vuoto
     [[ -z "$rrule" ]] && return
-
+    
     # Rimuovi BYMONTH (problema noto)
     rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
-
+    
     # Normalizza UNTIL a solo data (ignora orario e Z)
     rrule=$(echo "$rrule" | sed -E 's/UNTIL=[0-9]{8}T[0-9]{6}Z?/UNTIL=NORM/g')
-
+    
     # Estrai i componenti e ordina alfabeticamente
     local freq="" byday="" bymonthday="" bymonth="" until="" interval="" count="" wkst=""
-
+    
     IFS=';' read -ra components <<< "$rrule"
     for component in "${components[@]}"; do
         case "$component" in
@@ -418,7 +418,7 @@ normalize_rrule_for_comparison() {
             WKST=*) wkst="$component" ;;
         esac
     done
-
+    
     # Ricostruisci in ordine standard: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH
     local normalized=""
     [[ -n "$freq" ]] && normalized="${normalized}${freq};"
@@ -429,10 +429,10 @@ normalize_rrule_for_comparison() {
     [[ -n "$bymonthday" ]] && normalized="${normalized}${bymonthday};"
     [[ -n "$bymonth" ]] && normalized="${normalized}${bymonth};"
     [[ -n "$wkst" ]] && normalized="${normalized}${wkst};"
-
+    
     # Rimuovi ultimo ";"
     normalized="${normalized%;}"
-
+    
     echo "$normalized"
 }
 
@@ -817,7 +817,7 @@ option_A() {
             # Normalizza RRULE usando la funzione dedicata
             local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
             rrule=$(normalize_rrule_for_comparison "$rrule")
-
+            
             local key="${dtstart}||${rrule}"  # Chiave composta normalizzata
 
             proton_events["$key"]="${summary}||${uid}"
@@ -858,7 +858,7 @@ option_A() {
             # Normalizza RRULE usando la funzione dedicata
             local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
             rrule=$(normalize_rrule_for_comparison "$rrule")
-
+            
             local key="${dtstart}||${rrule}"  # Chiave composta normalizzata
 
             calcurse_events["$key"]="${summary}||${uid}"
@@ -880,9 +880,118 @@ option_A() {
     declare -a events_to_delete_from_calcurse
     declare -a events_to_export_to_proton
 
+    # ============================================================
+    # NUOVO: Controllo EXDATE per eventi ricorrenti
+    # ============================================================
+    declare -A exdate_conflicts
+    local exdate_conflict_count=0
+    
+    # Confronta EXDATE per tutti gli eventi con stessa chiave (DTSTART+RRULE)
+    # anche se hanno UID diversi
+    for key in "${!proton_events[@]}"; do
+        # Se l'evento esiste in entrambi i calendari (stessa chiave)
+        if [[ -n "${calcurse_events[$key]}" ]]; then
+            # Estrai EXDATE da entrambi i blocchi
+            local proton_block="${proton_blocks[$key]}"
+            local calcurse_block="${calcurse_blocks[$key]}"
+            
+            # Estrai tutti gli EXDATE (possono essere su righe multiple)
+            # e normalizza: rimuovi TZID, spazi, estrai solo le date
+            local proton_exdate=""
+            while IFS= read -r line; do
+                # Estrai solo la data/ora dopo i due punti, rimuovi TZID
+                local date_part=$(echo "$line" | sed 's/^EXDATE[^:]*://' | tr -d '\r\n ' | sed 's/;TZID=[^:]*://')
+                [[ -n "$date_part" ]] && proton_exdate="${proton_exdate},${date_part}"
+            done < <(echo "$proton_block" | grep "^EXDATE")
+            proton_exdate="${proton_exdate#,}"  # Rimuovi virgola iniziale
+            
+            local calcurse_exdate=""
+            while IFS= read -r line; do
+                local date_part=$(echo "$line" | sed 's/^EXDATE[^:]*://' | tr -d '\r\n ' | sed 's/;TZID=[^:]*://')
+                [[ -n "$date_part" ]] && calcurse_exdate="${calcurse_exdate},${date_part}"
+            done < <(echo "$calcurse_block" | grep "^EXDATE")
+            calcurse_exdate="${calcurse_exdate#,}"  # Rimuovi virgola iniziale
+            
+            # Ordina le date per confronto consistente
+            if [[ -n "$proton_exdate" ]]; then
+                proton_exdate=$(echo "$proton_exdate" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
+            fi
+            if [[ -n "$calcurse_exdate" ]]; then
+                calcurse_exdate=$(echo "$calcurse_exdate" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
+            fi
+            
+            # Se EXDATE sono diversi, segnala conflitto
+            if [[ "$proton_exdate" != "$calcurse_exdate" ]]; then
+                exdate_conflicts["$key"]="$proton_exdate||$calcurse_exdate"
+                ((exdate_conflict_count++))
+            fi
+        fi
+    done
+    
+    # Mostra conflitti EXDATE all'utente
+    if [[ $exdate_conflict_count -gt 0 ]]; then
+        echo "⚠️  Found $exdate_conflict_count recurring event(s) with different exclusions (EXDATE)"
+        echo ""
+        
+        for key in "${!exdate_conflicts[@]}"; do
+            IFS='||' read -r proton_exdate calcurse_exdate <<< "${exdate_conflicts[$key]}"
+            
+            # Recupera informazioni sull'evento
+            IFS='||' read -r summary proton_uid <<< "${proton_events[$key]}"
+            IFS='||' read -r _ calcurse_uid <<< "${calcurse_events[$key]}"
+            
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "⚠️  Recurring event with different exclusions:"
+            echo "   📝 Title: ${summary:-[No title]}"
+            echo "   📅 Date/Time: $key"
+            echo "   🆔 Proton UID: $proton_uid"
+            echo "   🆔 Calcurse UID: $calcurse_uid"
+            echo ""
+            echo "   📅 Excluded dates in Proton:"
+            if [[ -n "$proton_exdate" ]]; then
+                echo "$proton_exdate" | tr ',' '\n' | sed 's/^/      /'
+            else
+                echo "      (none)"
+            fi
+            echo ""
+            echo "   📅 Excluded dates in Calcurse:"
+            if [[ -n "$calcurse_exdate" ]]; then
+                echo "$calcurse_exdate" | tr ',' '\n' | sed 's/^/      /'
+            else
+                echo "      (none)"
+            fi
+            echo ""
+            echo "   What do you want to do?"
+            echo "   P) Use Proton version (update Calcurse with Proton's exclusions)"
+            echo "   C) Use Calcurse version (update Proton with Calcurse's exclusions)"
+            echo "   S) Skip (leave both as is)"
+            echo ""
+            read -rp "   Choice (P/C/S): " exdate_choice
+            
+            case "${exdate_choice^^}" in
+                P)
+                    # Importa la versione Proton in Calcurse (sostituisce quella esistente)
+                    events_to_import_to_calcurse+=("$key")
+                    events_to_delete_from_calcurse+=("$key")
+                    echo "   ✅ Will update Calcurse with Proton's exclusions"
+                    ;;
+                C)
+                    # Esporta la versione Calcurse in Proton
+                    events_to_export_to_proton+=("$key")
+                    echo "   ✅ Will update Proton with Calcurse's exclusions"
+                    ;;
+                *)
+                    echo "   ⏭️  Skipped (no changes)"
+                    ;;
+            esac
+        done
+        echo ""
+    fi
+    # ============================================================
+
     # Confronto: eventi in Proton ma non in Calcurse
     local proton_only_count=0
-    #echo "🔍 Checking events present only in Proton..."
+    echo "🔍 Checking events present only in Proton..."
 
     for key in "${!proton_events[@]}"; do
         if [[ -z "${calcurse_events[$key]}" ]]; then
@@ -1075,10 +1184,10 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
             if [[ -z "${to_delete[$key]}" ]]; then
                 echo "$block" >> "$filtered_temp"
                 ((kept_count++))
-                #echo "  -> MANTENUTO"
+                echo "  -> MANTENUTO"
             else
                 ((deleted_count++))
-                #echo "  -> ELIMINATO"
+                echo "  -> ELIMINATO"
             fi
 
             in_event=0
