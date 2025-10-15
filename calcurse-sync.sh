@@ -332,6 +332,28 @@ generate_event_uid() {
     echo "CALCURSE-${uid_hash}@$(hostname)"
 }
 
+# ----------------------------------------------------------------------
+# GENERA CHIAVE UNIVOCA PER IDENTIFICARE EVENTI
+# Fix: risolve il bug degli eventi con stesso DTSTART
+# ----------------------------------------------------------------------
+generate_event_key() {
+    local event_block="$1"
+
+    local dtstart=$(echo "$event_block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+    local summary=$(echo "$event_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
+    local rrule=$(echo "$event_block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
+
+    [[ -n "$rrule" ]] && rrule=$(normalize_rrule_for_comparison "$rrule")
+
+    local uid=$(echo "$event_block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+
+    if [[ -n "$uid" ]]; then
+        echo "UID:${uid}"
+    else
+        echo "${dtstart}||${summary}||${rrule}"
+    fi
+}
+
 export_calcurse_with_uids() {
    # echo "📤 Esporto i miei eventi con UID in $EXPORT_FILE…"
     local temp_export=$(mktemp)
@@ -392,19 +414,19 @@ export_calcurse_with_uids() {
 # ----------------------------------------------------------------------
 normalize_rrule_for_comparison() {
     local rrule="$1"
-    
+
     # Se vuoto, ritorna vuoto
     [[ -z "$rrule" ]] && return
-    
+
     # Rimuovi BYMONTH (problema noto)
     rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
-    
+
     # Normalizza UNTIL a solo data (ignora orario e Z)
     rrule=$(echo "$rrule" | sed -E 's/UNTIL=[0-9]{8}T[0-9]{6}Z?/UNTIL=NORM/g')
-    
+
     # Estrai i componenti e ordina alfabeticamente
     local freq="" byday="" bymonthday="" bymonth="" until="" interval="" count="" wkst=""
-    
+
     IFS=';' read -ra components <<< "$rrule"
     for component in "${components[@]}"; do
         case "$component" in
@@ -418,7 +440,7 @@ normalize_rrule_for_comparison() {
             WKST=*) wkst="$component" ;;
         esac
     done
-    
+
     # Ricostruisci in ordine standard: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH
     local normalized=""
     [[ -n "$freq" ]] && normalized="${normalized}${freq};"
@@ -429,10 +451,10 @@ normalize_rrule_for_comparison() {
     [[ -n "$bymonthday" ]] && normalized="${normalized}${bymonthday};"
     [[ -n "$bymonth" ]] && normalized="${normalized}${bymonth};"
     [[ -n "$wkst" ]] && normalized="${normalized}${wkst};"
-    
+
     # Rimuovi ultimo ";"
     normalized="${normalized%;}"
-    
+
     echo "$normalized"
 }
 
@@ -442,43 +464,72 @@ normalize_rrule_for_comparison() {
 compute_event_hash() {
     local event_block="$1"
 
-    local dtstart=$(echo "$event_block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-    local summary=$(echo "$event_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-    local description=$(echo "$event_block" | grep -m1 "^DESCRIPTION:" | cut -d: -f2- | tr -d '\r\n')
+    # Normalizza: rimuovi campi che variano tra sistemi
+    local normalized_block=$(echo "$event_block" | grep -v "^STATUS:" | grep -v "^SEQUENCE:" | grep -v "^DTSTAMP:")
 
-    local duration_min=0
-    if echo "$event_block" | grep -q "^DURATION:"; then
-        local duration=$(echo "$event_block" | grep -m1 "^DURATION:" | cut -d: -f2-)
-        if [[ $duration =~ P([0-9]+)DT([0-9]+)H([0-9]+)M ]]; then
-            duration_min=$((${BASH_REMATCH[1]} * 1440 + ${BASH_REMATCH[2]} * 60 + ${BASH_REMATCH[3]}))
+    # DTSTART: rimuovi TZID per normalizzare
+    local dtstart=$(echo "$normalized_block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+
+    local summary=$(echo "$normalized_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
+
+    # DESCRIPTION: Prendi solo quella FUORI da VALARM
+    local description=""
+    local in_alarm=0
+    while IFS= read -r line; do
+        if [[ "$line" == "BEGIN:VALARM" ]]; then
+            in_alarm=1
+        elif [[ "$line" == "END:VALARM" ]]; then
+            in_alarm=0
+        elif [[ $in_alarm -eq 0 && "$line" =~ ^DESCRIPTION: ]]; then
+            description=$(echo "$line" | cut -d: -f2- | tr -d '\r\n')
+            break
         fi
-    elif echo "$event_block" | grep -q "^DTEND"; then
-        duration_min=30
+    done <<< "$normalized_block"
+
+    # DURATION: calcola correttamente o da DTEND
+    local duration_min=0
+    if echo "$normalized_block" | grep -q "^DURATION:"; then
+        local duration=$(echo "$normalized_block" | grep -m1 "^DURATION:" | cut -d: -f2- | tr -d '\r\n')
+        # Parsing completo: P0DT0H3M0S
+        local days=0 hours=0 minutes=0
+        [[ $duration =~ P([0-9]+)D ]] && days=${BASH_REMATCH[1]}
+        [[ $duration =~ ([0-9]+)H ]] && hours=${BASH_REMATCH[1]}
+        [[ $duration =~ ([0-9]+)M ]] && minutes=${BASH_REMATCH[1]}
+        duration_min=$((days * 1440 + hours * 60 + minutes))
+    elif echo "$normalized_block" | grep -q "^DTEND"; then
+        # Calcola differenza tra DTEND e DTSTART
+        local dtend=$(echo "$normalized_block" | grep -m1 "^DTEND" | sed 's/^DTEND[^:]*://' | tr -d '\r\n ')
+
+        # Estrai ore e minuti da DTSTART e DTEND (formato: YYYYMMDDTHHmmss)
+        if [[ ${#dtstart} -ge 15 && ${#dtend} -ge 15 ]]; then
+            local start_hour=${dtstart:9:2}
+            local start_min=${dtstart:11:2}
+            local end_hour=${dtend:9:2}
+            local end_min=${dtend:11:2}
+
+            # Calcola minuti totali
+            local start_total=$((10#$start_hour * 60 + 10#$start_min))
+            local end_total=$((10#$end_hour * 60 + 10#$end_min))
+            duration_min=$((end_total - start_total))
+
+            # Se negativo (evento attraversa mezzanotte), aggiungi 24 ore
+            [[ $duration_min -lt 0 ]] && duration_min=$((duration_min + 1440))
+        else
+            # Fallback se formato non riconosciuto
+            duration_min=30
+        fi
     fi
 
-    local alarm_sig=""
-    if echo "$event_block" | grep -q "BEGIN:VALARM"; then
-        while IFS= read -r trigger_line; do
-            local trigger=$(echo "$trigger_line" | cut -d: -f2-)
-            local seconds=$(convert_trigger_to_seconds "$trigger")
-            local rounded=$((seconds / 300 * 300))
-            alarm_sig="${alarm_sig},${rounded}"
-        done < <(echo "$event_block" | grep "^TRIGGER:")
-        alarm_sig="${alarm_sig#,}"
-    fi
-
-    echo -n "${dtstart}|${summary}|${description}|${duration_min}|${alarm_sig}" | \
+    # NON includere alarm_sig nell'hash (varia tra sistemi)
+    echo -n "${dtstart}|${summary}|${description}|${duration_min}" | \
         sha256sum | cut -d' ' -f1 | head -c16
 }
-
-# ----------------------------------------------------------------------
 # FUNZIONE DI CONFRONTO OTTIMIZZATA
 # ----------------------------------------------------------------------
 find_new_events() {
     local proton_file="$1"
     local calcurse_file="$2"
     local output_file="$3"
-
 
     echo "🔍 Comparing .ics files to find new events… "
 
@@ -492,15 +543,14 @@ find_new_events() {
     awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$proton_file" | tr -d '\r' > "$proton_tmp"
     awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$calcurse_file" | tr -d '\r' > "$calcurse_tmp"
 
-
     declare -A proton_hashes
     declare -A proton_uids
     declare -A proton_summaries
+    declare -A proton_events_by_key
 
     local block="" in_event=0 proton_count=0
 
-    #echo "📊 Indicizzazione eventi Proton..."
-
+    # Indicizzazione eventi Proton
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
             block="$line"
@@ -518,6 +568,10 @@ find_new_events() {
             local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
             [[ -n "$summary" ]] && proton_summaries["$summary"]="$dtstart"
 
+            # FIX: Usa chiave univoca
+            local key=$(generate_event_key "$block")
+            proton_events_by_key["$key"]=1
+
             ((proton_count++))
             in_event=0
             block=""
@@ -525,8 +579,6 @@ find_new_events() {
             block+=$'\n'"$line"
         fi
     done < "$proton_tmp"
-
-    # echo "📊 Trovati $proton_count eventi nel file Proton"
 
     cat > "$out_tmp" <<EOF
 BEGIN:VCALENDAR
@@ -537,8 +589,7 @@ EOF
     local new_count=0
     block="" in_event=0
 
-   # echo "🔍 Ricerca nuovi eventi in Calcurse..."
-
+    # Ricerca nuovi eventi in Calcurse
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
             block="$line"
@@ -548,21 +599,28 @@ EOF
 
             local is_duplicate=0
 
-            local hash=$(compute_event_hash "$block")
-            if [[ -n "${proton_hashes[$hash]}" ]]; then
+            # FIX: Check per chiave univoca PRIMA (priorità massima)
+            local key=$(generate_event_key "$block")
+            if [[ -n "${proton_events_by_key[$key]}" ]]; then
                 is_duplicate=1
             else
-                local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
-                if [[ -n "$uid" && -n "${proton_uids[$uid]}" ]]; then
+                # Fallback su hash se chiave non matcha
+                local hash=$(compute_event_hash "$block")
+                if [[ -n "${proton_hashes[$hash]}" ]]; then
                     is_duplicate=1
                 else
-                    local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-                    local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+                    local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+                    if [[ -n "$uid" && -n "${proton_uids[$uid]}" ]]; then
+                        is_duplicate=1
+                    else
+                        local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
+                        local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
 
-                    if [[ -n "$summary" && -n "${proton_summaries[$summary]}" ]]; then
-                        local proton_dtstart="${proton_summaries[$summary]}"
-                        if [[ "${dtstart:0:8}" == "${proton_dtstart:0:8}" ]]; then
-                            is_duplicate=1
+                        if [[ -n "$summary" && -n "${proton_summaries[$summary]}" ]]; then
+                            local proton_dtstart="${proton_summaries[$summary]}"
+                            if [[ "${dtstart:0:8}" == "${proton_dtstart:0:8}" ]]; then
+                                is_duplicate=1
+                            fi
                         fi
                     fi
                 fi
@@ -571,6 +629,7 @@ EOF
             if [[ $is_duplicate -eq 0 ]]; then
                 local enriched_block=$(enrich_event_for_proton "$block")
                 local cleaned_block=""
+
                 while IFS= read -r line; do
                     if [[ "$line" =~ ^RRULE: ]]; then
                         local rrule="${line#RRULE:}"
@@ -587,6 +646,7 @@ EOF
 
                 echo "$normalized_event" >> "$out_tmp"
                 ((new_count++))
+
                 local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
                 local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
                 echo "➕ New event: $summary ($dtstart)"
@@ -603,10 +663,7 @@ EOF
 
     sed '/^$/d' "$out_tmp" > "$output_file"
     rm -f "$proton_tmp" "$calcurse_tmp" "$out_tmp"
-
-   # echo "✅ Trovati $new_count nuovi eventi genuini in $output_file"
 }
-
 # ----------------------------------------------------------------------
 # FUNZIONE DI FILTRO TEMPORALE
 # ----------------------------------------------------------------------
@@ -795,6 +852,7 @@ option_A() {
     # Indicizzazione Proton
     declare -A proton_events
     declare -A proton_blocks
+    declare -A proton_uids_to_keys  # Mappa UID → KEY
 
     local block=""
     local in_event=0
@@ -811,17 +869,16 @@ option_A() {
 
             local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
             # Normalizza DTSTART: rimuovi TZID e altri parametri, solo data/ora
-            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n' | tr -d 'Z')
             local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n')
 
             # Normalizza RRULE usando la funzione dedicata
-            local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
             rrule=$(normalize_rrule_for_comparison "$rrule")
-            
-            local key="${dtstart}||${rrule}"  # Chiave composta normalizzata
+
+            local key=$(generate_event_key "$block")
 
             proton_events["$key"]="${summary}||${uid}"
             proton_blocks["$key"]="$block"
+            [[ -n "$uid" ]] && proton_uids_to_keys["$uid"]="$key"
 
             ((proton_count++))
             in_event=0
@@ -836,6 +893,7 @@ option_A() {
     # Indicizzazione Calcurse
     declare -A calcurse_events
     declare -A calcurse_blocks
+    declare -A calcurse_uids_to_keys
 
     block=""
     in_event=0
@@ -852,17 +910,16 @@ option_A() {
 
             local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
             # Normalizza DTSTART: rimuovi TZID e altri parametri, solo data/ora
-            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n' | tr -d 'Z')
             local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n')
 
             # Normalizza RRULE usando la funzione dedicata
-            local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
             rrule=$(normalize_rrule_for_comparison "$rrule")
-            
-            local key="${dtstart}||${rrule}"  # Chiave composta normalizzata
+
+            local key=$(generate_event_key "$block")
 
             calcurse_events["$key"]="${summary}||${uid}"
             calcurse_blocks["$key"]="$block"
+            [[ -n "$uid" ]] && calcurse_uids_to_keys["$uid"]="$key"
 
             ((calcurse_count++))
             in_event=0
@@ -873,6 +930,22 @@ option_A() {
     done < "$calcurse_tmp"
 
     #echo "✅ Indicizzati $calcurse_count eventi da Calcurse"
+    echo "🔍 Pre-computing content hashes for fast comparison..."
+
+    declare -A calcurse_hashes_map
+    declare -A proton_hashes_map
+
+    for key in "${!calcurse_events[@]}"; do
+        local hash=$(compute_event_hash "${calcurse_blocks[$key]}")
+        calcurse_hashes_map["$hash"]="$key"
+    done
+
+    for key in "${!proton_events[@]}"; do
+        local hash=$(compute_event_hash "${proton_blocks[$key]}")
+        proton_hashes_map["$hash"]="$key"
+    done
+
+    echo "✅ Hash maps created (${#calcurse_hashes_map[@]} + ${#proton_hashes_map[@]} entries)"
     echo ""
 
     # Array per tracciare le decisioni
@@ -885,7 +958,7 @@ option_A() {
     # ============================================================
     declare -A exdate_conflicts
     local exdate_conflict_count=0
-    
+
     # Confronta EXDATE per tutti gli eventi con stessa chiave (DTSTART+RRULE)
     # anche se hanno UID diversi
     for key in "${!proton_events[@]}"; do
@@ -894,7 +967,7 @@ option_A() {
             # Estrai EXDATE da entrambi i blocchi
             local proton_block="${proton_blocks[$key]}"
             local calcurse_block="${calcurse_blocks[$key]}"
-            
+
             # Estrai tutti gli EXDATE (possono essere su righe multiple)
             # e normalizza: rimuovi TZID, spazi, estrai solo le date
             local proton_exdate=""
@@ -904,14 +977,14 @@ option_A() {
                 [[ -n "$date_part" ]] && proton_exdate="${proton_exdate},${date_part}"
             done < <(echo "$proton_block" | grep "^EXDATE")
             proton_exdate="${proton_exdate#,}"  # Rimuovi virgola iniziale
-            
+
             local calcurse_exdate=""
             while IFS= read -r line; do
                 local date_part=$(echo "$line" | sed 's/^EXDATE[^:]*://' | tr -d '\r\n ' | sed 's/;TZID=[^:]*://')
                 [[ -n "$date_part" ]] && calcurse_exdate="${calcurse_exdate},${date_part}"
             done < <(echo "$calcurse_block" | grep "^EXDATE")
             calcurse_exdate="${calcurse_exdate#,}"  # Rimuovi virgola iniziale
-            
+
             # Ordina le date per confronto consistente
             if [[ -n "$proton_exdate" ]]; then
                 proton_exdate=$(echo "$proton_exdate" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
@@ -919,7 +992,7 @@ option_A() {
             if [[ -n "$calcurse_exdate" ]]; then
                 calcurse_exdate=$(echo "$calcurse_exdate" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
             fi
-            
+
             # Se EXDATE sono diversi, segnala conflitto
             if [[ "$proton_exdate" != "$calcurse_exdate" ]]; then
                 exdate_conflicts["$key"]="$proton_exdate||$calcurse_exdate"
@@ -927,19 +1000,19 @@ option_A() {
             fi
         fi
     done
-    
+
     # Mostra conflitti EXDATE all'utente
     if [[ $exdate_conflict_count -gt 0 ]]; then
         echo "⚠️  Found $exdate_conflict_count recurring event(s) with different exclusions (EXDATE)"
         echo ""
-        
+
         for key in "${!exdate_conflicts[@]}"; do
             IFS='||' read -r proton_exdate calcurse_exdate <<< "${exdate_conflicts[$key]}"
-            
+
             # Recupera informazioni sull'evento
             IFS='||' read -r summary proton_uid <<< "${proton_events[$key]}"
             IFS='||' read -r _ calcurse_uid <<< "${calcurse_events[$key]}"
-            
+
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "⚠️  Recurring event with different exclusions:"
             echo "   📝 Title: ${summary:-[No title]}"
@@ -967,7 +1040,7 @@ option_A() {
             echo "   S) Skip (leave both as is)"
             echo ""
             read -rp "   Choice (P/C/S): " exdate_choice
-            
+
             case "${exdate_choice^^}" in
                 P)
                     # Importa la versione Proton in Calcurse (sostituisce quella esistente)
@@ -994,7 +1067,30 @@ option_A() {
     echo "🔍 Checking events present only in Proton..."
 
     for key in "${!proton_events[@]}"; do
-        if [[ -z "${calcurse_events[$key]}" ]]; then
+        local found_in_calcurse=0
+
+        # Check 1: Confronto diretto per chiave
+        if [[ -n "${calcurse_events[$key]}" ]]; then
+            found_in_calcurse=1
+        else
+            # Check 2: Cerca per UID (se chiave basata su UID o nel blocco)
+            if [[ "$key" =~ ^UID: ]]; then
+                local proton_uid="${key#UID:}"
+                [[ -n "${calcurse_uids_to_keys[$proton_uid]}" ]] && found_in_calcurse=1
+            else
+                local proton_uid=$(echo "${proton_blocks[$key]}" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+                [[ -n "$proton_uid" && -n "${calcurse_uids_to_keys[$proton_uid]}" ]] && found_in_calcurse=1
+            fi
+
+            # Check 3: OTTIMIZZATO - Hash lookup O(1)
+            if [[ $found_in_calcurse -eq 0 ]]; then
+                local proton_hash=$(compute_event_hash "${proton_blocks[$key]}")
+                [[ -n "${calcurse_hashes_map[$proton_hash]}" ]] && found_in_calcurse=1
+            fi
+        fi
+
+        # Se NON trovato dopo tutti i check, è veramente nuovo
+        if [[ $found_in_calcurse -eq 0 ]]; then
             IFS='||' read -r summary uid <<< "${proton_events[$key]}"
             ((proton_only_count++))
 
@@ -1022,9 +1118,30 @@ option_A() {
     #echo "🔍 Verifico eventi presenti solo in Calcurse..."
 
     for key in "${!calcurse_events[@]}"; do
-        if [[ -z "${proton_events[$key]}" ]]; then
+        local found_in_proton=0
+
+        # Check 1: Confronto diretto
+        if [[ -n "${proton_events[$key]}" ]]; then
+            found_in_proton=1
+        else
+            # Check 2: Cerca per UID
+            if [[ "$key" =~ ^UID: ]]; then
+                local calcurse_uid="${key#UID:}"
+                [[ -n "${proton_uids_to_keys[$calcurse_uid]}" ]] && found_in_proton=1
+            else
+                local calcurse_uid=$(echo "${calcurse_blocks[$key]}" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+                [[ -n "$calcurse_uid" && -n "${proton_uids_to_keys[$calcurse_uid]}" ]] && found_in_proton=1
+            fi
+
+            # Check 3: Hash lookup O(1)
+            if [[ $found_in_proton -eq 0 ]]; then
+                local calcurse_hash=$(compute_event_hash "${calcurse_blocks[$key]}")
+                [[ -n "${proton_hashes_map[$calcurse_hash]}" ]] && found_in_proton=1
+            fi
+        fi
+
+        if [[ $found_in_proton -eq 0 ]]; then
             IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
-            ((calcurse_only_count++))
 
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1151,10 +1268,9 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     done
 
     # Esporta SOLO appuntamenti (no TODO)
+    # Usa l'export con UID già generato all'inizio (stesso dell'indicizzazione)
     local current_export=$(mktemp)
-    calcurse -D "$CALCURSE_DIR" --export --export-uid | \
-        awk '/^BEGIN:VTODO/,/^END:VTODO/ {next} 1' > "$current_export"
-
+    awk '/^BEGIN:VTODO/,/^END:VTODO/ {next} 1' "$EXPORT_FILE" > "$current_export"
     local filtered_temp=$(mktemp)
     echo "BEGIN:VCALENDAR" > "$filtered_temp"
     echo "VERSION:2.0" >> "$filtered_temp"
@@ -1174,20 +1290,18 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
             block+=$'\n'"$line"
             ((event_count++))
 
-            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
-            local rrule=$(echo "$block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
-            local key="${dtstart}||${rrule}"
-
+            # FIX: Usa generate_event_key come negli altri loop
+            local key=$(generate_event_key "$block")
             #echo "DEBUG: Evento #$event_count - Chiave estratta: [$key]"
 
             # Includi solo se NON è nella lista da eliminare
             if [[ -z "${to_delete[$key]}" ]]; then
                 echo "$block" >> "$filtered_temp"
                 ((kept_count++))
-                echo "  -> MANTENUTO"
+                #echo "  -> MANTENUTO"
             else
                 ((deleted_count++))
-                echo "  -> ELIMINATO"
+                #echo "  -> ELIMINATO"
             fi
 
             in_event=0
@@ -1380,6 +1494,7 @@ option_B() {
     declare -A calcurse_hashes
     declare -A calcurse_uids
     declare -A calcurse_summaries
+    declare -A calcurse_events_by_key
 
     local block="" in_event=0
 
@@ -1399,7 +1514,8 @@ option_B() {
             local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
             local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
             [[ -n "$summary" ]] && calcurse_summaries["$summary"]="$dtstart"
-
+            local key=$(generate_event_key "$block")
+            calcurse_events_by_key["$key"]=1
             in_event=0
             block=""
         elif (( in_event )); then
@@ -1414,6 +1530,7 @@ option_B() {
     echo "VERSION:2.0" >> "$new_events_for_calcurse"
     echo "PRODID:-//calcurse-sync//Import da Proton//" >> "$new_events_for_calcurse"
 
+    # Loop di confronto eventi da Proton
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
             block="$line"
@@ -1423,21 +1540,28 @@ option_B() {
 
             local should_import=1
 
-            local hash=$(compute_event_hash "$block")
-            if [[ -n "${calcurse_hashes[$hash]}" ]]; then
+            # FIX: Check chiave univoca PRIMA (priorità massima)
+            local key=$(generate_event_key "$block")
+            if [[ -n "${calcurse_events_by_key[$key]}" ]]; then
                 should_import=0
             else
-                local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
-                if [[ -n "$uid" && -n "${calcurse_uids[$uid]}" ]]; then
+                # Fallback su hash se chiave non matcha
+                local hash=$(compute_event_hash "$block")
+                if [[ -n "${calcurse_hashes[$hash]}" ]]; then
                     should_import=0
                 else
-                    local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-                    local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+                    local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+                    if [[ -n "$uid" && -n "${calcurse_uids[$uid]}" ]]; then
+                        should_import=0
+                    else
+                        local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
+                        local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
 
-                    if [[ -n "$summary" && -n "${calcurse_summaries[$summary]}" ]]; then
-                        local calcurse_dtstart="${calcurse_summaries[$summary]}"
-                        if [[ "${dtstart:0:8}" == "${calcurse_dtstart:0:8}" ]]; then
-                            should_import=0
+                        if [[ -n "$summary" && -n "${calcurse_summaries[$summary]}" ]]; then
+                            local calcurse_dtstart="${calcurse_summaries[$summary]}"
+                            if [[ "${dtstart:0:8}" == "${calcurse_dtstart:0:8}" ]]; then
+                                should_import=0
+                            fi
                         fi
                     fi
                 fi
@@ -1457,7 +1581,6 @@ option_B() {
             block+=$'\n'"$line"
         fi
     done < "$proton_tmp"
-
     echo "END:VCALENDAR" >> "$new_events_for_calcurse"
 
     if [[ $import_count -gt 0 ]]; then
@@ -1562,7 +1685,7 @@ option_E() {
         echo "❌ Export cancelled."
         return 1
     fi
-    
+
     read -rp "Days in the future to include (default: 90): " days_future
     days_future=${days_future:-90}
     echo ""
