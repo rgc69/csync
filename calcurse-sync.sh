@@ -1012,13 +1012,25 @@ option_A() {
             # Recupera informazioni sull'evento
             IFS='||' read -r summary proton_uid <<< "${proton_events[$key]}"
             IFS='||' read -r _ calcurse_uid <<< "${calcurse_events[$key]}"
+            # Estrai data/ora dal blocco evento
+			local event_datetime=""
+			local dtstart_line=$(echo "${proton_blocks[$key]}" | grep -m1 "^DTSTART")
+			if [[ -n "$dtstart_line" ]]; then
+				if [[ "$dtstart_line" =~ VALUE=DATE ]]; then
+					local date_only=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+					event_datetime=$(date -d "${date_only:0:8}" "+%d/%m/%Y" 2>/dev/null || echo "$date_only")
+				else
+					local datetime=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+					event_datetime=$(date -d "${datetime:0:8} ${datetime:9:2}:${datetime:11:2}" "+%d/%m/%Y %H:%M" 2>/dev/null || echo "$datetime")
+				fi
+			fi
 
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "⚠️  Recurring event with different exclusions:"
-            echo "   📝 Title: ${summary:-[No title]}"
-            echo "   📅 Date/Time: $key"
-            echo "   🆔 Proton UID: $proton_uid"
-            echo "   🆔 Calcurse UID: $calcurse_uid"
+			echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+			echo "⚠️  Recurring event with different exclusions:"
+			echo "   📝 Title: ${summary:-[No title]}"
+			echo "   📅 Date/Time: ${event_datetime:-$key}"
+			echo "   🆔 Proton UID: $proton_uid"
+			echo "   🆔 Calcurse UID: $calcurse_uid"
             echo ""
             echo "   📅 Excluded dates in Proton:"
             if [[ -n "$proton_exdate" ]]; then
@@ -1093,13 +1105,27 @@ option_A() {
         if [[ $found_in_calcurse -eq 0 ]]; then
             IFS='||' read -r summary uid <<< "${proton_events[$key]}"
             ((proton_only_count++))
+            # Estrai data/ora dal blocco evento
+            local event_datetime=""
+            local dtstart_line=$(echo "${proton_blocks[$key]}" | grep -m1 "^DTSTART")
+            if [[ -n "$dtstart_line" ]]; then
+                if [[ "$dtstart_line" =~ VALUE=DATE ]]; then
+                    # Evento giornata intera
+                    local date_only=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+                    event_datetime=$(date -d "${date_only:0:8}" "+%d/%m/%Y" 2>/dev/null || echo "$date_only")
+                else
+                    # Evento con ora
+                    local datetime=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+                    event_datetime=$(date -d "${datetime:0:8} ${datetime:9:2}:${datetime:11:2}" "+%d/%m/%Y %H:%M" 2>/dev/null || echo "$datetime")
+                fi
+            fi
 
             echo ""
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📍 Event #$proton_only_count present in Proton but not in Calcurse:"
-            echo "   📝 Title: ${summary:-[Senza titolo]}"
-            echo "   📅 Date/Time: $key"
-            echo "   🆔 UID: $uid"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+			echo "📝 Event #$proton_only_count present in Proton but not in Calcurse:"
+			echo "   📝 Title: ${summary:-[Senza titolo]}"
+			echo "   📅 Date/Time: ${event_datetime:-$key}"
+			echo "   🆔 UID: $uid"
             echo ""
             read -rp "   ➡️  Do you want to import it into Calcurse? (y/N): " import_choice
 
@@ -1142,13 +1168,27 @@ option_A() {
 
         if [[ $found_in_proton -eq 0 ]]; then
             IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
+            # Estrai data/ora dal blocco evento
+			local event_datetime=""
+			local dtstart_line=$(echo "${calcurse_blocks[$key]}" | grep -m1 "^DTSTART")
+			if [[ -n "$dtstart_line" ]]; then
+				if [[ "$dtstart_line" =~ VALUE=DATE ]]; then
+					# Evento giornata intera
+					local date_only=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+					event_datetime=$(date -d "${date_only:0:8}" "+%d/%m/%Y" 2>/dev/null || echo "$date_only")
+				else
+					# Evento con ora
+					local datetime=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+					event_datetime=$(date -d "${datetime:0:8} ${datetime:9:2}:${datetime:11:2}" "+%d/%m/%Y %H:%M" 2>/dev/null || echo "$datetime")
+				fi
+			fi
 
-            echo ""
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📍 Event #$calcurse_only_count present in Calcurse but not in Proton:"
-            echo "   📝 Title: ${summary:-[Senza titolo]}"
-            echo "   📅 Date/Time: $key"
-            echo "   🆔 UID: $uid"
+			echo ""
+			echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+			echo "📝 Event #$calcurse_only_count present in Calcurse but not in Proton:"
+			echo "   📝 Title: ${summary:-[Senza titolo]}"
+			echo "   📅 Date/Time: ${event_datetime:-$key}"
+			echo "   🆔 UID: $uid"
             echo ""
             echo "   What do you want to do?"
             echo "   A) 🗑️  Delete it from Calcurse (it was already deleted in Proton)"
