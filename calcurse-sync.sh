@@ -217,19 +217,82 @@ clean_rrule_for_proton() {
 # ----------------------------------------------------------------------
 # ARRICCHIMENTO EVENTI PER COMPATIBILITÀ PROTON
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# ARRICCHIMENTO EVENTI PER COMPATIBILITÀ PROTON
+# Converte RRULE:FREQ=DAILY;UNTIL in DTEND per eventi brevi (<= 90 giorni)
+# Mantiene RRULE per eventi ricorrenti veri (settimanali, mensili, lunghi)
+# ----------------------------------------------------------------------
 enrich_event_for_proton() {
     local event_block="$1"
     local user_tz="${TZ:-Europe/Rome}"
     local result=""
     local has_dtstamp=0
     local has_sequence=0
-    local dtstart="" dtend="" duration=""
+    local dtstart="" dtend="" duration="" rrule=""
+    local has_rrule=0
 
-    # Prima passata: leggi e converti DURATION -> DTEND
+    # Prima passata: leggi e converti DURATION -> DTEND + RRULE:FREQ=DAILY;UNTIL -> DTEND (solo per eventi brevi)
     while IFS= read -r line; do
-        if [[ "$line" =~ ^DTSTART:(.+) ]]; then
-            dtstart="${BASH_REMATCH[1]}"
-            result+="DTSTART;TZID=$user_tz:$dtstart"$'\n'
+        if [[ "$line" =~ ^DTSTART ]]; then
+            # Estrai DTSTART preservando VALUE=DATE se presente
+            if [[ "$line" =~ VALUE=DATE ]]; then
+                dtstart=$(echo "$line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+                result+="DTSTART;VALUE=DATE:$dtstart"$'\n'
+            else
+                dtstart=$(echo "$line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+                result+="DTSTART;TZID=$user_tz:$dtstart"$'\n'
+            fi
+        elif [[ "$line" =~ ^RRULE: ]]; then
+            rrule="${line#RRULE:}"
+
+            # Converti SOLO se è un evento multi-day semplice (prenotazione)
+            # Criteri: FREQ=DAILY;UNTIL=... senza altri parametri (no INTERVAL, COUNT, BYDAY)
+            if [[ "$rrule" =~ ^FREQ=DAILY\;UNTIL=[0-9]{8}$ ]]; then
+                # È un evento multi-day semplice, converti in DTEND
+                local until_date=$(echo "$rrule" | sed -n 's/.*UNTIL=\([0-9]\{8\}\).*/\1/p')
+
+                if [[ -n "$until_date" && -n "$dtstart" ]]; then
+                    # Calcola durata per verificare che sia ragionevole (<= 90 giorni)
+                    local start_epoch=$(date -d "${dtstart:0:4}-${dtstart:4:2}-${dtstart:6:2}" +%s 2>/dev/null)
+                    local until_epoch=$(date -d "${until_date:0:4}-${until_date:4:2}-${until_date:6:2}" +%s 2>/dev/null)
+
+                    if [[ -n "$start_epoch" && -n "$until_epoch" ]]; then
+                        local duration_days=$(( (until_epoch - start_epoch) / 86400 ))
+
+                        # Converti solo se durata <= 90 giorni (prenotazioni tipiche)
+                        if [[ $duration_days -ge 0 && $duration_days -le 90 ]]; then
+                            # UNTIL è l'ultimo giorno, DTEND deve essere il giorno DOPO
+                            local dtend_date=$(date -d "${until_date:0:4}-${until_date:4:2}-${until_date:6:2} + 1 day" +%Y%m%d 2>/dev/null)
+
+                            if [[ -z "$dtend_date" ]]; then
+                                # Fallback per macOS
+                                dtend_date=$(date -j -v+1d -f "%Y%m%d" "$until_date" +%Y%m%d 2>/dev/null)
+                            fi
+
+                            if [[ -n "$dtend_date" ]]; then
+                                result+="DTEND;VALUE=DATE:$dtend_date"$'\n'
+                                has_rrule=1
+                            else
+                                # Conversione fallita, mantieni RRULE
+                                result+="$line"$'\n'
+                            fi
+                        else
+                            # Durata troppo lunga, mantieni RRULE (evento ricorrente vero)
+                            result+="$line"$'\n'
+                        fi
+                    else
+                        # Calcolo epoch fallito, mantieni RRULE
+                        result+="$line"$'\n'
+                    fi
+                else
+                    # UNTIL o DTSTART mancante, mantieni RRULE
+                    result+="$line"$'\n'
+                fi
+            else
+                # Non è FREQ=DAILY;UNTIL semplice, mantieni RRULE originale
+                # (eventi ricorrenti settimanali, mensili, o con altri parametri)
+                result+="$line"$'\n'
+            fi
         elif [[ "$line" =~ ^DURATION:(.+) ]]; then
             duration="${BASH_REMATCH[1]}"
             # Calcola DTEND (parsing semplificato)
@@ -268,7 +331,6 @@ enrich_event_for_proton() {
 
     echo "${result%$'\n'}"
 }
-
 # ----------------------------------------------------------------------
 # CONTROLLO SE SYNC EXPORT NECESSARIA (solo per C/D/E)
 # ----------------------------------------------------------------------
@@ -1273,44 +1335,25 @@ option_A() {
     calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup failed"
     echo "✅ Backup saved: $BACKUP_FILE"
 
-    # FASE 1: Importa eventi da Proton a Calcurse
-    if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
-        echo ""
-        echo "📥 Importing ${#events_to_import_to_calcurse[@]} events form Proton to Calcurse..."
-
-        local import_temp=$(mktemp)
-        echo "BEGIN:VCALENDAR" > "$import_temp"
-        echo "VERSION:2.0" >> "$import_temp"
-        echo "PRODID:-//calcurse-sync//Import da Proton//" >> "$import_temp"
-
-        for key in "${events_to_import_to_calcurse[@]}"; do
-            local normalized=$(normalize_alarms "${proton_blocks[$key]}" "calcurse")
-            echo "$normalized" >> "$import_temp"
-        done
-
-        echo "END:VCALENDAR" >> "$import_temp"
-
-        calcurse -D "$CALCURSE_DIR" -i "$import_temp" || die "Import failed"
-        rm -f "$import_temp"
-        echo "✅ Import completed"
-    fi
-
-    # FASE 2: Elimina eventi da Calcurse (tramite re-import filtrato)
+# FASE 1: Elimina eventi da Calcurse (tramite re-import filtrato)
 if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     echo ""
     echo "🗑️  Deleting ${#events_to_delete_from_calcurse[@]} events from Calcurse..."
 
     declare -A to_delete
-    #echo "DEBUG: Chiavi da eliminare:"
     for key in "${events_to_delete_from_calcurse[@]}"; do
         to_delete["$key"]=1
         echo "  -> [$key]"
     done
 
+    # Esporta TODO separatamente per preservarli
+    local todo_backup=$(mktemp)
+    calcurse -D "$CALCURSE_DIR" -t --export-uid > "$todo_backup" 2>/dev/null || true
+
     # Esporta SOLO appuntamenti (no TODO)
-    # Usa l'export con UID già generato all'inizio (stesso dell'indicizzazione)
     local current_export=$(mktemp)
     awk '/^BEGIN:VTODO/,/^END:VTODO/ {next} 1' "$EXPORT_FILE" > "$current_export"
+
     local filtered_temp=$(mktemp)
     echo "BEGIN:VCALENDAR" > "$filtered_temp"
     echo "VERSION:2.0" >> "$filtered_temp"
@@ -1330,46 +1373,69 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
             block+=$'\n'"$line"
             ((event_count++))
 
-            # FIX: Usa generate_event_key come negli altri loop
             local key=$(generate_event_key "$block")
-            #echo "DEBUG: Evento #$event_count - Chiave estratta: [$key]"
 
             # Includi solo se NON è nella lista da eliminare
             if [[ -z "${to_delete[$key]}" ]]; then
                 echo "$block" >> "$filtered_temp"
                 ((kept_count++))
-                #echo "  -> MANTENUTO"
             else
                 ((deleted_count++))
-                #echo "  -> ELIMINATO"
             fi
 
             in_event=0
             block=""
         elif (( in_event )); then
             block+=$'\n'"$line"
+        else
+            [[ "$line" =~ ^(BEGIN|VERSION|PRODID|CALSCALE|END):.*$ ]] && continue
+            echo "$line" >> "$filtered_temp"
         fi
     done < "$current_export"
 
     echo "END:VCALENDAR" >> "$filtered_temp"
 
-    echo ""
     echo "Processing summary:"
     echo "  - Total events processed: $event_count"
     echo "  - Events kept: $kept_count"
     echo "  - Events deleted: $deleted_count"
-    echo ""
 
-    # SVUOTA COMPLETAMENTE la directory Calcurse
-    rm -f "$CALCURSE_DIR/apts"
+    # CRITICAL: Cancella database Calcurse
+    echo "🗑️  Clearing Calcurse database..."
+    rm -f "$CALCURSE_DIR/apts" "$CALCURSE_DIR/todo"
 
-    # Re-importa il contenuto filtrato
-    calcurse -D "$CALCURSE_DIR" -i "$filtered_temp" || die "Eliminazione fallita"
+    # Re-import eventi filtrati in database vuoto
+    calcurse -D "$CALCURSE_DIR" -i "$filtered_temp" || die "Import failed"
 
-    rm -f "$current_export" "$filtered_temp"
+    # Re-import TODO se esistevano
+    if [[ -s "$todo_backup" ]]; then
+        calcurse -D "$CALCURSE_DIR" -i "$todo_backup" 2>/dev/null || true
+    fi
+
+    rm -f "$current_export" "$filtered_temp" "$todo_backup"
     echo "✅ Deletion completed"
 fi
+# FASE 2: Importa eventi da Proton a Calcurse DOPO
+if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
+    echo ""
+    echo "📥 Importing ${#events_to_import_to_calcurse[@]} events from Proton to Calcurse..."
 
+    local import_temp=$(mktemp)
+    echo "BEGIN:VCALENDAR" > "$import_temp"
+    echo "VERSION:2.0" >> "$import_temp"
+    echo "PRODID:-//calcurse-sync//Import da Proton//" >> "$import_temp"
+
+    for key in "${events_to_import_to_calcurse[@]}"; do
+        local normalized=$(normalize_alarms "${proton_blocks[$key]}" "calcurse")
+        echo "$normalized" >> "$import_temp"
+    done
+
+    echo "END:VCALENDAR" >> "$import_temp"
+
+    calcurse -D "$CALCURSE_DIR" -i "$import_temp" || die "Import failed"
+    rm -f "$import_temp"
+    echo "✅ Import completed"
+fi
     # FASE 3: Genera file per export a Proton
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
         echo ""
