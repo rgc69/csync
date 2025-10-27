@@ -221,6 +221,44 @@ clean_rrule_for_proton() {
 # ARRICCHIMENTO EVENTI PER COMPATIBILITÀ PROTON
 # Converte RRULE:FREQ=DAILY;UNTIL in DTEND per eventi brevi (<= 90 giorni)
 # Mantiene RRULE per eventi ricorrenti veri (settimanali, mensili, lunghi)
+
+# ----------------------------------------------------------------------
+# AGGIUNGI COLOR PER EVENTI BNB IN PROTON
+# ----------------------------------------------------------------------
+add_bnb_color() {
+    local event_block="$1"
+    local summary=""
+    local color=""
+    local result=""
+    local in_event=0
+
+    # Estrai SUMMARY per identificare l'appartamento
+    summary=$(echo "$event_block" | grep "^SUMMARY:" | cut -d: -f2-)
+
+    # Determina il colore basato sull'appartamento
+    if echo "$summary" | grep -qi "Appartamento 1\|Apt 1\|Camera Matrimoniale"; then
+        color="turquoise"
+    elif echo "$summary" | grep -qi "Appartamento 2\|Apt 2\|Camera Doppia"; then
+        color="cherry"
+    elif echo "$summary" | grep -qi "Appartamento 3\|Apt 3\|Camera Tripla\|Camera Quadrupla"; then
+        color="green"
+    fi
+
+    # Se abbiamo un colore, aggiungilo dopo UID
+    if [ -n "$color" ]; then
+        while IFS= read -r line; do
+            result+="$line"$'\n'
+            if [[ "$line" =~ ^UID: ]]; then
+                result+="COLOR:$color"$'\n'
+            fi
+        done < <(echo "$event_block")
+        echo "${result%$'\n'}"
+    else
+        # Nessun colore, restituisci così com'è
+        echo "$event_block"
+    fi
+}
+
 # ----------------------------------------------------------------------
 enrich_event_for_proton() {
     local event_block="$1"
@@ -1402,6 +1440,13 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
 
     # CRITICAL: Cancella database Calcurse
     echo "🗑️  Clearing Calcurse database..."
+    # BACKUP TODO PRIMA DI SVUOTARE
+    local todo_backup=$(mktemp)
+    if [ -f "$CALCURSE_DIR/todo" ]; then
+        cp "$CALCURSE_DIR/todo" "$todo_backup"
+        echo "✓ TODO backed up"
+    fi
+
     rm -f "$CALCURSE_DIR/apts" "$CALCURSE_DIR/todo"
 
     # Re-import eventi filtrati in database vuoto
@@ -1410,6 +1455,13 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     # Re-import TODO se esistevano
     if [[ -s "$todo_backup" ]]; then
         calcurse -D "$CALCURSE_DIR" -i "$todo_backup" 2>/dev/null || true
+    fi
+
+    # RIPRISTINA TODO
+    if [ -f "$todo_backup" ]; then
+        cp "$todo_backup" "$CALCURSE_DIR/todo"
+        rm -f "$todo_backup"
+        echo "✓ TODO restored"
     fi
 
     rm -f "$current_export" "$filtered_temp" "$todo_backup"
@@ -1450,6 +1502,8 @@ fi
 
             # Arricchisci per Proton
             event_block=$(enrich_event_for_proton "$event_block")
+            # Aggiungi COLOR per BnB
+            event_block=$(add_bnb_color "$event_block")
 
             # Pulisci RRULE
             local cleaned_block=""
