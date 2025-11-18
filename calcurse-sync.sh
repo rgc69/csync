@@ -197,8 +197,8 @@ clean_rrule_for_proton() {
 
 
     # Rimuovi elementi non supportati da Proton
-    if [[ "$rrule" =~ FREQ=WEEKLY ]]; then
-        # Per ricorrenze settimanali, rimuovi BYMONTH
+    if [[ "$rrule" =~ FREQ=WEEKLY || "$rrule" =~ FREQ=DAILY ]]; then
+        # Per ricorrenze giornalieri e settimanali, rimuovi BYMONTH
         rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
     fi
 
@@ -239,7 +239,7 @@ add_bnb_color() {
     if echo "$summary" | grep -qi "Appartamento 1\|Apt 1\|Camera Matrimoniale"; then
         color="turquoise"
     elif echo "$summary" | grep -qi "Appartamento 2\|Apt 2\|Camera Doppia"; then
-        color="cherry"
+        color="crimson"
     elif echo "$summary" | grep -qi "Appartamento 3\|Apt 3\|Camera Tripla\|Camera Quadrupla"; then
         color="green"
     fi
