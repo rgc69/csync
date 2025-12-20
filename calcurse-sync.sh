@@ -189,6 +189,265 @@ normalize_alarms() {
 }
 
 # ----------------------------------------------------------------------
+# SANITIZZAZIONE ICS PER IMPORT IN CALCURSE
+# (calcurse è molto severo su EXDATE/TZID e sull'ordine di alcuni campi)
+# ----------------------------------------------------------------------
+
+_ics_clean_datetime_value() {
+    # Input: YYYYMMDDTHHMMSS[Z] oppure varianti con timezone/parametri già rimossi
+    # Output: YYYYMMDDTHHMMSS (senza Z)
+    local v="$1"
+    v="${v%%Z}"                          # drop trailing Z
+    v="$(echo "$v" | tr -d '\r\n ')"     # trim
+    v="$(echo "$v" | tr -cd '0-9T,')"    # keep only digits/T/commas
+
+    # If it's a single datetime, normalize seconds to HHMMSS
+    if [[ "$v" != *","* ]]; then
+        if [[ "$v" =~ ^[0-9]{8}T[0-9]{4}$ ]]; then
+            v="${v}00"
+        fi
+    else
+        # For lists, normalize each token individually (add seconds if missing)
+        local out=""
+        IFS=',' read -ra parts <<< "$v"
+        for p in "${parts[@]}"; do
+            if [[ "$p" =~ ^[0-9]{8}T[0-9]{4}$ ]]; then
+                p="${p}00"
+            fi
+            [[ -z "$out" ]] && out="$p" || out="${out},${p}"
+        done
+        v="$out"
+    fi
+
+    echo "$v"
+}
+
+_ics_clean_date_value() {
+    # Input may contain YYYYMMDD or YYYYMMDDT000000 etc. Output: YYYYMMDD
+    local v="$1"
+    v="${v%%Z}"
+    v="$(echo "$v" | tr -d '\r\n ')"
+    v="$(echo "$v" | tr -cd '0-9T,')"
+    # Take only the date part for each token
+    local out=""
+    IFS=',' read -ra parts <<< "$v"
+    for p in "${parts[@]}"; do
+        local d="${p:0:8}"
+        [[ -z "$out" ]] && out="$d" || out="${out},${d}"
+    done
+    echo "$out"
+}
+
+_ics_duration_from_dtstart_dtend() {
+    # Input: dtstart dtend in YYYYMMDDTHHMMSS (floating/local)
+    # Output: RFC5545 duration like P0DT1H30M0S
+    local s="$1"
+    local e="$2"
+
+    # Convert to "YYYY-MM-DD HH:MM:SS"
+    local s_iso="${s:0:4}-${s:4:2}-${s:6:2} ${s:9:2}:${s:11:2}:${s:13:2}"
+    local e_iso="${e:0:4}-${e:4:2}-${e:6:2} ${e:9:2}:${e:11:2}:${e:13:2}"
+
+    local s_epoch e_epoch diff
+    s_epoch=$(date -d "$s_iso" +%s 2>/dev/null) || return 1
+    e_epoch=$(date -d "$e_iso" +%s 2>/dev/null) || return 1
+    diff=$(( e_epoch - s_epoch ))
+    # Cross-midnight safety
+    [[ $diff -lt 0 ]] && diff=$(( diff + 86400 ))
+
+    local days=$(( diff / 86400 ))
+    local rem=$(( diff % 86400 ))
+    local hours=$(( rem / 3600 ))
+    rem=$(( rem % 3600 ))
+    local mins=$(( rem / 60 ))
+    local secs=$(( rem % 60 ))
+
+    echo "P${days}DT${hours}H${mins}M${secs}S"
+}
+
+sanitize_vevent_for_calcurse() {
+    # Produce a minimal, calcurse-friendly VEVENT:
+    # - Remove TZID params from DTSTART/DTEND/EXDATE
+    # - Normalize EXDATE type/format (DATE vs DATE-TIME)
+    # - Convert DTEND -> DURATION for timed events (more reliable with calcurse)
+    # - Drop VALARM blocks entirely (calcurse import is picky)
+    # - Keep ordering stable with DTSTART early
+    local block="$1"
+
+    local uid="" summary="" description="" location=""
+    local dtstart_raw="" dtend_raw="" duration_raw=""
+    local rrule_raw=""
+    local exdate_raw_list=()
+
+    local in_alarm=0
+    while IFS= read -r line; do
+        case "$line" in
+            "BEGIN:VALARM"*) in_alarm=1; continue ;;
+            "END:VALARM"*) in_alarm=0; continue ;;
+        esac
+        [[ $in_alarm -eq 1 ]] && continue
+
+        case "$line" in
+            UID:*) uid="${line#UID:}" ;;
+            SUMMARY:*) summary="${line#SUMMARY:}" ;;
+            DESCRIPTION:*) [[ -z "$description" ]] && description="${line#DESCRIPTION:}" ;;
+            LOCATION:*) location="${line#LOCATION:}" ;;
+            DTSTART*) dtstart_raw="$line" ;;
+            DTEND*) dtend_raw="$line" ;;
+            DURATION:*) duration_raw="${line#DURATION:}" ;;
+            RRULE:*) rrule_raw="${line#RRULE:}" ;;
+            EXDATE*) exdate_raw_list+=("$line") ;;
+            *) : ;;
+        esac
+    done < <(echo "$block" | tr -d '\r')
+
+    # DTSTART parse + type
+    local dtstart_val="$(echo "$dtstart_raw" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')"
+    local is_allday=0
+    if echo "$dtstart_raw" | grep -q "VALUE=DATE" || [[ "$dtstart_val" != *"T"* ]]; then
+        is_allday=1
+        dtstart_val="$(_ics_clean_date_value "$dtstart_val")"
+    else
+        dtstart_val="$(_ics_clean_datetime_value "$dtstart_val")"
+    fi
+
+    # DTEND parse
+    local dtend_val=""
+    if [[ -n "$dtend_raw" ]]; then
+        dtend_val="$(echo "$dtend_raw" | sed 's/^DTEND[^:]*://' | tr -d '\r\n ')"
+        if [[ $is_allday -eq 1 ]]; then
+            dtend_val="$(_ics_clean_date_value "$dtend_val")"
+        else
+            dtend_val="$(_ics_clean_datetime_value "$dtend_val")"
+        fi
+    fi
+
+    # RRULE: remove trailing Z from UNTIL if present (calcurse import is stricter)
+    local rrule_out="$rrule_raw"
+    if [[ -n "$rrule_out" ]]; then
+        rrule_out="$(echo "$rrule_out" | sed -E 's/UNTIL=([0-9]{8}T[0-9]{6})Z/UNTIL=\1/g' | sed -E 's/UNTIL=([0-9]{8})Z/UNTIL=\1/g')"
+    fi
+
+    # EXDATE normalize (merge multiple EXDATE lines -> single line)
+    local ex_out=""
+    if [[ ${#exdate_raw_list[@]} -gt 0 ]]; then
+        local merged=""
+        for exl in "${exdate_raw_list[@]}"; do
+            local v="$(echo "$exl" | sed 's/^EXDATE[^:]*://' | tr -d '\r\n ')"
+            if [[ $is_allday -eq 1 ]]; then
+                v="$(_ics_clean_date_value "$v")"
+            else
+                v="$(_ics_clean_datetime_value "$v")"
+            fi
+            [[ -z "$v" ]] && continue
+            if [[ -z "$merged" ]]; then
+                merged="$v"
+            else
+                merged="${merged},${v}"
+            fi
+        done
+        # Deduplicate tokens
+        if [[ -n "$merged" ]]; then
+            IFS=',' read -ra toks <<< "$merged"
+            local -A seen=()
+            local uniq=""
+            for t in "${toks[@]}"; do
+                [[ -z "$t" ]] && continue
+                if [[ -z "${seen[$t]}" ]]; then
+                    seen[$t]=1
+                    [[ -z "$uniq" ]] && uniq="$t" || uniq="${uniq},${t}"
+                fi
+            done
+            if [[ -n "$uniq" ]]; then
+                if [[ $is_allday -eq 1 ]]; then
+                    ex_out="EXDATE;VALUE=DATE:${uniq}"
+                else
+                    ex_out="EXDATE:${uniq}"
+                fi
+            fi
+        fi
+    fi
+
+    # Duration/End normalization:
+    local duration_out=""
+    local dtend_out=""
+
+    if [[ -n "$duration_raw" ]]; then
+        duration_out="DURATION:${duration_raw}"
+    else
+        if [[ $is_allday -eq 1 ]]; then
+            [[ -n "$dtend_val" ]] && dtend_out="DTEND;VALUE=DATE:${dtend_val}"
+        else
+            if [[ -n "$dtend_val" && -n "$dtstart_val" ]]; then
+                local dur="$(_ics_duration_from_dtstart_dtend "$dtstart_val" "$dtend_val" 2>/dev/null || true)"
+                if [[ -n "$dur" ]]; then
+                    duration_out="DURATION:${dur}"
+                else
+                    # Fallback: keep DTEND without params
+                    dtend_out="DTEND:${dtend_val}"
+                fi
+            fi
+        fi
+    fi
+
+    # Build sanitized event
+    local out="BEGIN:VEVENT"$'\n'
+    [[ -n "$uid" ]] && out+="UID:${uid}"$'\n'
+
+    if [[ $is_allday -eq 1 ]]; then
+        out+="DTSTART;VALUE=DATE:${dtstart_val}"$'\n'
+        [[ -n "$dtend_out" ]] && out+="${dtend_out}"$'\n'
+    else
+        out+="DTSTART:${dtstart_val}"$'\n'
+        [[ -n "$duration_out" ]] && out+="${duration_out}"$'\n'
+        [[ -n "$dtend_out" ]] && out+="${dtend_out}"$'\n'
+    fi
+
+    [[ -n "$rrule_out" ]] && out+="RRULE:${rrule_out}"$'\n'
+    [[ -n "$ex_out" ]] && out+="${ex_out}"$'\n'
+    [[ -n "$summary" ]] && out+="SUMMARY:${summary}"$'\n'
+    [[ -n "$location" ]] && out+="LOCATION:${location}"$'\n'
+    [[ -n "$description" ]] && out+="DESCRIPTION:${description}"$'\n'
+    out+="END:VEVENT"
+
+    echo "$out"
+}
+
+sanitize_calendar_for_calcurse_import() {
+    local input_file="$1"
+    local output_file="$2"
+
+    [[ -f "$input_file" ]] || return 1
+
+    local tmp_events=$(mktemp)
+    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$input_file" | tr -d '\r' > "$tmp_events"
+
+    {
+        echo "BEGIN:VCALENDAR"
+        echo "VERSION:2.0"
+        echo "PRODID:-//calcurse-sync//Sanitized for calcurse//"
+        local block="" in_event=0
+        while IFS= read -r line; do
+            if [[ "$line" == "BEGIN:VEVENT" ]]; then
+                block="$line"
+                in_event=1
+            elif [[ "$line" == "END:VEVENT" ]]; then
+                block+=$'\n'"$line"
+                sanitize_vevent_for_calcurse "$block"
+                in_event=0
+                block=""
+            elif (( in_event )); then
+                block+=$'\n'"$line"
+            fi
+        done < "$tmp_events"
+        echo "END:VCALENDAR"
+    } > "$output_file"
+
+    rm -f "$tmp_events"
+}
+
+
+# ----------------------------------------------------------------------
 # PULIZIA RRULE PER COMPATIBILITÀ PROTON
 # ----------------------------------------------------------------------
 
@@ -565,12 +824,32 @@ compute_event_hash() {
     local event_block="$1"
 
     # Normalizza: rimuovi campi che variano tra sistemi
-    local normalized_block=$(echo "$event_block" | grep -v "^STATUS:" | grep -v "^SEQUENCE:" | grep -v "^DTSTAMP:")
+    local normalized_block
+    normalized_block=$(echo "$event_block" | grep -v "^STATUS:" | grep -v "^SEQUENCE:" | grep -v "^DTSTAMP:")
 
-    # DTSTART: rimuovi TZID per normalizzare
-    local dtstart=$(echo "$normalized_block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
+    # Helper locale: normalizza token data/ora (YYYYMMDD o YYYYMMDDTHHMMSS)
+    _norm_dt_token_for_hash() {
+        local v="$1"
+        v=$(echo "$v" | tr -d '
+' | sed 's/Z$//')
+        # Togli caratteri strani, lascia solo цифre e T
+        v=$(echo "$v" | tr -cd '0-9T')
+        if [[ "$v" =~ ^[0-9]{8}T[0-9]{4}$ ]]; then
+            v="${v}00"
+        fi
+        echo "$v"
+    }
 
-    local summary=$(echo "$normalized_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
+    local dtstart_line dtstart dtend_line dtend
+    dtstart_line=$(echo "$normalized_block" | grep -m1 "^DTSTART")
+    dtstart=$(_norm_dt_token_for_hash "$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' )")
+
+    dtend_line=$(echo "$normalized_block" | grep -m1 "^DTEND")
+    dtend=$(_norm_dt_token_for_hash "$(echo "$dtend_line" | sed 's/^DTEND[^:]*://' )")
+
+    local summary
+    summary=$(echo "$normalized_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '
+')
 
     # DESCRIPTION: Prendi solo quella FUORI da VALARM
     local description=""
@@ -581,7 +860,8 @@ compute_event_hash() {
         elif [[ "$line" == "END:VALARM" ]]; then
             in_alarm=0
         elif [[ $in_alarm -eq 0 && "$line" =~ ^DESCRIPTION: ]]; then
-            description=$(echo "$line" | cut -d: -f2- | tr -d '\r\n')
+            description=$(echo "$line" | cut -d: -f2- | tr -d '
+')
             break
         fi
     done <<< "$normalized_block"
@@ -589,41 +869,113 @@ compute_event_hash() {
     # DURATION: calcola correttamente o da DTEND
     local duration_min=0
     if echo "$normalized_block" | grep -q "^DURATION:"; then
-        local duration=$(echo "$normalized_block" | grep -m1 "^DURATION:" | cut -d: -f2- | tr -d '\r\n')
-        # Parsing completo: P0DT0H3M0S
+        local duration
+        duration=$(echo "$normalized_block" | grep -m1 "^DURATION:" | cut -d: -f2- | tr -d '
+')
         local days=0 hours=0 minutes=0
         [[ $duration =~ P([0-9]+)D ]] && days=${BASH_REMATCH[1]}
         [[ $duration =~ ([0-9]+)H ]] && hours=${BASH_REMATCH[1]}
         [[ $duration =~ ([0-9]+)M ]] && minutes=${BASH_REMATCH[1]}
         duration_min=$((days * 1440 + hours * 60 + minutes))
-    elif echo "$normalized_block" | grep -q "^DTEND"; then
-        # Calcola differenza tra DTEND e DTSTART
-        local dtend=$(echo "$normalized_block" | grep -m1 "^DTEND" | sed 's/^DTEND[^:]*://' | tr -d '\r\n ')
-
-        # Estrai ore e minuti da DTSTART e DTEND (formato: YYYYMMDDTHHmmss)
-        if [[ ${#dtstart} -ge 15 && ${#dtend} -ge 15 ]]; then
+    elif [[ -n "$dtend" ]]; then
+        # Caso "all-day": DTSTART/DTEND sono date-only (YYYYMMDD)
+        if [[ "$dtstart" =~ ^[0-9]{8}$ && "$dtend" =~ ^[0-9]{8}$ ]]; then
+            local s="${dtstart:0:4}-${dtstart:4:2}-${dtstart:6:2}"
+            local e="${dtend:0:4}-${dtend:4:2}-${dtend:6:2}"
+            local s_epoch e_epoch
+            s_epoch=$(date -d "$s" +%s 2>/dev/null || echo "")
+            e_epoch=$(date -d "$e" +%s 2>/dev/null || echo "")
+            if [[ -n "$s_epoch" && -n "$e_epoch" ]]; then
+                local days_diff=$(( (e_epoch - s_epoch) / 86400 ))
+                [[ $days_diff -le 0 ]] && days_diff=1
+                duration_min=$((days_diff * 1440))
+            else
+                duration_min=1440
+            fi
+        # Caso "timed": YYYYMMDDTHHMMSS
+        elif [[ "$dtstart" =~ ^[0-9]{8}T[0-9]{6}$ && "$dtend" =~ ^[0-9]{8}T[0-9]{6}$ ]]; then
             local start_hour=${dtstart:9:2}
             local start_min=${dtstart:11:2}
             local end_hour=${dtend:9:2}
             local end_min=${dtend:11:2}
-
-            # Calcola minuti totali
             local start_total=$((10#$start_hour * 60 + 10#$start_min))
             local end_total=$((10#$end_hour * 60 + 10#$end_min))
             duration_min=$((end_total - start_total))
-
-            # Se negativo (evento attraversa mezzanotte), aggiungi 24 ore
             [[ $duration_min -lt 0 ]] && duration_min=$((duration_min + 1440))
         else
             # Fallback se formato non riconosciuto
             duration_min=30
         fi
+    else
+        # Nessun DTEND/DURATION: se è all-day, considera 1 giorno, altrimenti 30 min
+        if [[ "$dtstart" =~ ^[0-9]{8}$ ]]; then
+            duration_min=1440
+        else
+            duration_min=30
+        fi
     fi
 
-    # NON includere alarm_sig nell'hash (varia tra sistemi)
-    echo -n "${dtstart}|${summary}|${description}|${duration_min}" | \
-        sha256sum | cut -d' ' -f1 | head -c16
+    # NON includere alarm_sig o EXDATE nell'hash (variano tra sistemi)
+    echo -n "${dtstart}|${summary}|${description}|${duration_min}" | sha256sum | cut -d' ' -f1 | head -c16
 }
+
+
+# ----------------------------------------------------------------------
+# HELPERS: normalizzazione EXDATE/DTSTART per confronto e import Calcurse
+# ----------------------------------------------------------------------
+
+_norm_dt_token_common() {
+    local v="$1"
+    v=$(echo "$v" | tr -d ' \r\n' | sed 's/Z$//')
+    v=$(echo "$v" | tr -cd '0-9T')
+    if [[ "$v" =~ ^[0-9]{8}T[0-9]{4}$ ]]; then
+        v="${v}00"
+    fi
+    echo "$v"
+}
+
+extract_exdates_normalized() {
+    local event_block="$1"
+    local acc=""
+    while IFS= read -r line; do
+        [[ "$line" =~ ^EXDATE ]] || continue
+        local payload="${line#*:}"
+        payload=$(echo "$payload" | tr -d '\r\n ')
+        IFS=',' read -ra parts <<< "$payload"
+        for p in "${parts[@]}"; do
+            local t=$(_norm_dt_token_common "$p")
+            [[ -n "$t" ]] && acc+="${t}"$'\n'
+        done
+    done < <(echo "$event_block" | grep "^EXDATE")
+
+    if [[ -z "$acc" ]]; then
+        echo ""
+        return 0
+    fi
+
+    echo "$acc" | sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
+generate_recurrence_signature() {
+    local event_block="$1"
+    local dtstart_line dtstart summary rrule
+    dtstart_line=$(echo "$event_block" | grep -m1 "^DTSTART")
+    dtstart=$(_norm_dt_token_common "$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' )")
+
+    summary=$(echo "$event_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
+    rrule=$(echo "$event_block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
+    [[ -n "$rrule" ]] && rrule=$(normalize_rrule_for_comparison "$rrule")
+
+    echo "${dtstart}|${summary}|${rrule}"
+}
+
+sanitize_event_block_for_calcurse() {
+    # Backward-compatible wrapper:
+    # older parts of the script call this function, so keep the name,
+    # but delegate to the newer, stricter sanitizer.
+    sanitize_vevent_for_calcurse "$1"
+}
+
 # FUNZIONE DI CONFRONTO OTTIMIZZATA
 # ----------------------------------------------------------------------
 find_new_events() {
@@ -1052,85 +1404,104 @@ option_A() {
     declare -a events_to_import_to_calcurse
     declare -a events_to_delete_from_calcurse
     declare -a events_to_export_to_proton
-
     # ============================================================
-    # NUOVO: Controllo EXDATE per eventi ricorrenti
+    # EXDATE: gestisci le eccezioni sulle ricorrenze (cancellazione singola occorrenza)
     # ============================================================
-    declare -A exdate_conflicts
+    declare -A exdate_conflicts_by_id
     local exdate_conflict_count=0
+    local us=$'\x1f'
 
-    # Confronta EXDATE per tutti gli eventi con stessa chiave (DTSTART+RRULE)
-    # anche se hanno UID diversi
-    for key in "${!proton_events[@]}"; do
-        # Se l'evento esiste in entrambi i calendari (stessa chiave)
-        if [[ -n "${calcurse_events[$key]}" ]]; then
-            # Estrai EXDATE da entrambi i blocchi
-            local proton_block="${proton_blocks[$key]}"
-            local calcurse_block="${calcurse_blocks[$key]}"
-
-            # Estrai tutti gli EXDATE (possono essere su righe multiple)
-            # e normalizza: rimuovi TZID, spazi, estrai solo le date
-            local proton_exdate=""
-            while IFS= read -r line; do
-                # Estrai solo la data/ora dopo i due punti, rimuovi TZID
-                local date_part=$(echo "$line" | sed 's/^EXDATE[^:]*://' | tr -d '\r\n ' | sed 's/;TZID=[^:]*://')
-                [[ -n "$date_part" ]] && proton_exdate="${proton_exdate},${date_part}"
-            done < <(echo "$proton_block" | grep "^EXDATE")
-            proton_exdate="${proton_exdate#,}"  # Rimuovi virgola iniziale
-
-            local calcurse_exdate=""
-            while IFS= read -r line; do
-                local date_part=$(echo "$line" | sed 's/^EXDATE[^:]*://' | tr -d '\r\n ' | sed 's/;TZID=[^:]*://')
-                [[ -n "$date_part" ]] && calcurse_exdate="${calcurse_exdate},${date_part}"
-            done < <(echo "$calcurse_block" | grep "^EXDATE")
-            calcurse_exdate="${calcurse_exdate#,}"  # Rimuovi virgola iniziale
-
-            # Ordina le date per confronto consistente
-            if [[ -n "$proton_exdate" ]]; then
-                proton_exdate=$(echo "$proton_exdate" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
-            fi
-            if [[ -n "$calcurse_exdate" ]]; then
-                calcurse_exdate=$(echo "$calcurse_exdate" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
-            fi
-
-            # Se EXDATE sono diversi, segnala conflitto
-            if [[ "$proton_exdate" != "$calcurse_exdate" ]]; then
-                exdate_conflicts["$key"]="$proton_exdate||$calcurse_exdate"
-                ((exdate_conflict_count++))
-            fi
+    # Mappa firma ricorrenza → key (fallback quando UID differisce)
+    declare -A calcurse_sig_to_key
+    for ckey in "${!calcurse_events[@]}"; do
+        local cblock="${calcurse_blocks[$ckey]}"
+        if echo "$cblock" | grep -q "^RRULE:"; then
+            local csig
+            csig=$(generate_recurrence_signature "$cblock")
+            [[ -n "$csig" ]] && calcurse_sig_to_key["$csig"]="$ckey"
         fi
     done
 
-    # Mostra conflitti EXDATE all'utente
+    for pkey in "${!proton_events[@]}"; do
+        local pblock="${proton_blocks[$pkey]}"
+        if ! echo "$pblock" | grep -q "^RRULE:"; then
+            continue
+        fi
+
+        local puid
+        puid=$(echo "$pblock" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+
+        local ckey=""
+        if [[ -n "$puid" && -n "${calcurse_uids_to_keys[$puid]}" ]]; then
+            ckey="${calcurse_uids_to_keys[$puid]}"
+        else
+            local psig
+            psig=$(generate_recurrence_signature "$pblock")
+            [[ -n "${calcurse_sig_to_key[$psig]}" ]] && ckey="${calcurse_sig_to_key[$psig]}"
+        fi
+        [[ -z "$ckey" ]] && continue
+
+        local pex cex
+        pex=$(extract_exdates_normalized "$pblock")
+        cex=$(extract_exdates_normalized "${calcurse_blocks[$ckey]}")
+        # --- FIX: Normalize both to pure dates (YYYYMMDD) for comparison ---
+        # Remove T000000 (and any trailing garbage) to compare just the dates
+        # This prevents false conflicts like "20251230" vs "20251230T000000"
+        local pex_norm=$(echo "$pex" | sed 's/T[0-9]\{6\}//g' | sed 's/[^0-9,]//g')
+        local cex_norm=$(echo "$cex" | sed 's/T[0-9]\{6\}//g' | sed 's/[^0-9,]//g')
+
+        if [[ "$pex_norm" != "$cex_norm" ]]; then
+            local id="$puid"
+            [[ -z "$id" ]] && id="SIG:$(generate_recurrence_signature "$pblock")"
+            exdate_conflicts_by_id["$id"]="${pkey}${us}${ckey}${us}${pex}${us}${cex}"
+            ((exdate_conflict_count++))
+        fi
+    done
+
     if [[ $exdate_conflict_count -gt 0 ]]; then
         echo "⚠️  Found $exdate_conflict_count recurring event(s) with different exclusions (EXDATE)"
         echo ""
 
-        for key in "${!exdate_conflicts[@]}"; do
-            IFS='||' read -r proton_exdate calcurse_exdate <<< "${exdate_conflicts[$key]}"
+        for id in "${!exdate_conflicts_by_id[@]}"; do
+            local rec="${exdate_conflicts_by_id[$id]}"
 
-            # Recupera informazioni sull'evento
-            IFS='||' read -r summary proton_uid <<< "${proton_events[$key]}"
-            IFS='||' read -r _ calcurse_uid <<< "${calcurse_events[$key]}"
-            # Estrai data/ora dal blocco evento
-			local event_datetime=""
-			local dtstart_line=$(echo "${proton_blocks[$key]}" | grep -m1 "^DTSTART")
-			if [[ -n "$dtstart_line" ]]; then
-				if [[ "$dtstart_line" =~ VALUE=DATE ]]; then
-					local date_only=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-					event_datetime=$(date -d "${date_only:0:8}" "+%d/%m/%Y" 2>/dev/null || echo "$date_only")
-				else
-					local datetime=$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-					event_datetime=$(date -d "${datetime:0:8} ${datetime:9:2}:${datetime:11:2}" "+%d/%m/%Y %H:%M" 2>/dev/null || echo "$datetime")
-				fi
-			fi
+            local pkey="${rec%%${us}*}"
+            rec="${rec#*${us}}"
+            local ckey="${rec%%${us}*}"
+            rec="${rec#*${us}}"
+            local proton_exdate="${rec%%${us}*}"
+            local calcurse_exdate="${rec#*${us}}"
 
-			echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-			echo "⚠️  Recurring event with different exclusions:"
-			echo "   📝 Title: ${summary:-[No title]}"
-			echo "   📅 Date/Time: ${event_datetime:-$key}"
-			echo "   🆔 Proton UID: $proton_uid"
-			echo "   🆔 Calcurse UID: $calcurse_uid"
+            # Recupera informazioni evento
+            local pval="${proton_events[$pkey]}"
+            local summary="${pval%%||*}"
+            local proton_uid="${pval#*||}"
+
+            local cval="${calcurse_events[$ckey]}"
+            local calcurse_uid="${cval#*||}"
+
+            # Data/ora di riferimento (DTSTART Proton)
+            local event_datetime=""
+            local dtstart_line
+            dtstart_line=$(echo "${proton_blocks[$pkey]}" | grep -m1 "^DTSTART")
+            if [[ -n "$dtstart_line" ]]; then
+                local v
+                v=$(_norm_dt_token_common "$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' )")
+                if [[ "$v" =~ ^[0-9]{8}$ ]]; then
+                    event_datetime=$(date -d "${v:0:4}-${v:4:2}-${v:6:2}" "+%d/%m/%Y" 2>/dev/null || echo "$v")
+                elif [[ "$v" =~ ^[0-9]{8}T[0-9]{6}$ ]]; then
+                    event_datetime=$(date -d "${v:0:4}-${v:4:2}-${v:6:2} ${v:9:2}:${v:11:2}" "+%d/%m/%Y %H:%M" 2>/dev/null || echo "$v")
+                else
+                    event_datetime="$v"
+                fi
+            fi
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "⚠️  Recurring event with different exclusions:"
+            echo "   📝 Title: ${summary:-[No title]}"
+            echo "   📅 Date/Time: ${event_datetime:-$pkey}"
+            echo "   🆔 Proton UID: $proton_uid"
+            echo "   🆔 Calcurse UID: $calcurse_uid"
             echo ""
             echo "   📅 Excluded dates in Proton:"
             if [[ -n "$proton_exdate" ]]; then
@@ -1155,14 +1526,14 @@ option_A() {
 
             case "${exdate_choice^^}" in
                 P)
-                    # Importa la versione Proton in Calcurse (sostituisce quella esistente)
-                    events_to_import_to_calcurse+=("$key")
-                    events_to_delete_from_calcurse+=("$key")
+                    # Sostituisci in Calcurse: elimina la serie Calcurse e importa quella Proton
+                    events_to_delete_from_calcurse+=("$ckey")
+                    events_to_import_to_calcurse+=("$pkey")
                     echo "   ✅ Will update Calcurse with Proton's exclusions"
                     ;;
                 C)
-                    # Esporta la versione Calcurse in Proton
-                    events_to_export_to_proton+=("$key")
+                    # Esporta la versione Calcurse verso Proton (import manuale)
+                    events_to_export_to_proton+=("$ckey")
                     echo "   ✅ Will update Proton with Calcurse's exclusions"
                     ;;
                 *)
@@ -1172,7 +1543,6 @@ option_A() {
         done
         echo ""
     fi
-    # ============================================================
 
     # Confronto: eventi in Proton ma non in Calcurse
     local proton_only_count=0
@@ -1203,7 +1573,7 @@ option_A() {
 
         # Se NON trovato dopo tutti i check, è veramente nuovo
         if [[ $found_in_calcurse -eq 0 ]]; then
-            IFS='||' read -r summary uid <<< "${proton_events[$key]}"
+            local pval="${proton_events[$key]}"; local summary="${pval%%||*}"; local uid="${pval#*||}"
             ((proton_only_count++))
             # Estrai data/ora dal blocco evento
             local event_datetime=""
@@ -1267,7 +1637,7 @@ option_A() {
         fi
 
         if [[ $found_in_proton -eq 0 ]]; then
-            IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
+            local cval="${calcurse_events[$key]}"; local summary="${cval%%||*}"; local uid="${cval#*||}"
             # Estrai data/ora dal blocco evento
 			local event_datetime=""
 			local dtstart_line=$(echo "${calcurse_blocks[$key]}" | grep -m1 "^DTSTART")
@@ -1332,7 +1702,7 @@ option_A() {
     if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
         echo "📥 Events to import into Calcurse: ${#events_to_import_to_calcurse[@]}"
         for key in "${events_to_import_to_calcurse[@]}"; do
-            IFS='||' read -r summary uid <<< "${proton_events[$key]}"
+            local pval="${proton_events[$key]}"; local summary="${pval%%||*}"; local uid="${pval#*||}"
             local dtstart_display="${key%%::*}"
             echo "   • ${summary:-[Senza titolo]} ($dtstart_display)"
         done
@@ -1342,7 +1712,7 @@ option_A() {
     if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
         echo "🗑️  Events to delete from Calcurse: ${#events_to_delete_from_calcurse[@]}"
         for key in "${events_to_delete_from_calcurse[@]}"; do
-            IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
+            local cval="${calcurse_events[$key]}"; local summary="${cval%%||*}"; local uid="${cval#*||}"
             local dtstart_display="${key%%::*}"
             echo "   • ${summary:-[Senza titolo]} ($dtstart_display)"
         done
@@ -1352,7 +1722,7 @@ option_A() {
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
         echo "📤 Events to export to Proton: ${#events_to_export_to_proton[@]}"
         for key in "${events_to_export_to_proton[@]}"; do
-            IFS='||' read -r summary uid <<< "${calcurse_events[$key]}"
+            local cval="${calcurse_events[$key]}"; local summary="${cval%%||*}"; local uid="${cval#*||}"
             local dtstart_display="${key%%::*}"
             echo "   • ${summary:-[Senza titolo]} ($dtstart_display)"
         done
@@ -1450,7 +1820,13 @@ if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
     rm -f "$CALCURSE_DIR/apts" "$CALCURSE_DIR/todo"
 
     # Re-import eventi filtrati in database vuoto
-    calcurse -D "$CALCURSE_DIR" -i "$filtered_temp" || die "Import failed"
+    # Sanitize before import (EXDATE/TZID/order) to avoid calcurse strictness issues
+local filtered_sanitized=$(mktemp)
+sanitize_calendar_for_calcurse_import "$filtered_temp" "$filtered_sanitized"
+
+calcurse -D "$CALCURSE_DIR" -i "$filtered_sanitized" || die "Import failed"
+
+rm -f "$filtered_sanitized"
 
     # Re-import TODO se esistevano
     if [[ -s "$todo_backup" ]]; then
@@ -1478,13 +1854,20 @@ if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
     echo "PRODID:-//calcurse-sync//Import da Proton//" >> "$import_temp"
 
     for key in "${events_to_import_to_calcurse[@]}"; do
-        local normalized=$(normalize_alarms "${proton_blocks[$key]}" "calcurse")
+        local sanitized=$(sanitize_event_block_for_calcurse "${proton_blocks[$key]}")
+        local normalized=$(normalize_alarms "$sanitized" "calcurse")
         echo "$normalized" >> "$import_temp"
     done
 
     echo "END:VCALENDAR" >> "$import_temp"
 
-    calcurse -D "$CALCURSE_DIR" -i "$import_temp" || die "Import failed"
+    # Sanitize the import file as well (Proton often includes TZID on EXDATE/DTSTART)
+local import_sanitized=$(mktemp)
+sanitize_calendar_for_calcurse_import "$import_temp" "$import_sanitized"
+
+calcurse -D "$CALCURSE_DIR" -i "$import_sanitized" || die "Import failed"
+
+rm -f "$import_sanitized"
     rm -f "$import_temp"
     echo "✅ Import completed"
 fi
@@ -1745,7 +2128,10 @@ option_B() {
 
     if [[ $import_count -gt 0 ]]; then
         echo "📥 Importing $import_count new events from Proton to Calcurse…"
-        calcurse -D "$CALCURSE_DIR" -i "$new_events_for_calcurse" || die "Import failed"
+        local new_events_sanitized=$(mktemp)
+sanitize_calendar_for_calcurse_import "$new_events_for_calcurse" "$new_events_sanitized"
+calcurse -D "$CALCURSE_DIR" -i "$new_events_sanitized" || die "Import failed"
+rm -f "$new_events_sanitized"
 
     #    echo "📄 Aggiorno il file di export con i nuovi eventi importati..."
         export_calcurse_with_uids
@@ -1890,7 +2276,11 @@ option_F() {
     > "$CALCURSE_DIR/apts"
 
     echo "📥 Importing everything from Proton..."
-    calcurse -D "$CALCURSE_DIR" -i "$IMPORT_FILE" || die "Import failed"
+    # Import a sanitized copy to avoid TZID/EXDATE issues
+local proton_sanitized=$(mktemp)
+sanitize_calendar_for_calcurse_import "$IMPORT_FILE" "$proton_sanitized"
+calcurse -D "$CALCURSE_DIR" -i "$proton_sanitized" || die "Import failed"
+rm -f "$proton_sanitized"
 
     export_calcurse_with_uids
     clean_old_backups

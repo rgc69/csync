@@ -1,3 +1,4 @@
 *.ics
 *.txt
 .last_calcurse_export
+calcurse-sync.sh.old
