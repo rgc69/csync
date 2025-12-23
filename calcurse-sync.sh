@@ -2257,7 +2257,7 @@ option_E() {
 }
 
 option_F() {
-    echo "🔄 COMPLETE SYNC: Proton → Calcurse"
+    echo "🧹  COMPLETE SYNC: Proton → Calcurse"
     echo "⚠️  WARNING: This will completely replace Calcurse with Proton "
     echo "   All events in Calcurse not present in Proton will be LOST!"
 
@@ -2291,28 +2291,19 @@ rm -f "$proton_sanitized"
 
 echo "🔔 REMEMBER: Make sure you have downloaded the UPDATED file from Proton Calendar"
 echo "Choose an option:"
-echo "A) 🧹 GUIDED BIDIRECTIONAL SYNC: Calcurse ↔ Proton + report"
-echo "B) Import events from Proton (merge - ONLY additions)"
-echo "C) Export events to Proton (ONLY additions)"
-echo "D) Export only future events (30 days)"
-echo "E) Export with custom interval"
-echo "---------"
-echo "F) 🔄 COMPLETE SYNC: Proton → Calcurse (REPLACES everything)"
+echo "A) 🔄 GUIDED BIDIRECTIONAL SYNC: Calcurse ↔ Proton + report"
+echo "B) 🧹 COMPLETE SYNC: Proton → Calcurse (REPLACES everything)"
 echo "---------"
 echo "Q) ❌ Exit without operations"
 echo ""
 
 while true; do
-    read -rp "Enter A, B, C, D, E, F o Q: " choice
+    read -rp "Enter A, B or Q: " choice
 
     case "${choice^^}" in
         A) option_A; break ;;
-        B) option_B; break ;;
-        C) option_C; break ;;
-        D) option_D; break ;;
-        E) option_E; break ;;
-        F) option_F; break ;;
+        B|F) option_F; break ;;  # 'F' kept as a legacy alias
         Q) echo "👋 Goodbye!"; exit 0 ;;
-        *) echo "❌ Error: Invalid choice. Use A, B, C, D, E, F or Q." ;;
+        *) echo "❌ Error: Invalid choice. Use A, B or Q." ;;
     esac
 done
