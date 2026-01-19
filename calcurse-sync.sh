@@ -461,6 +461,16 @@ clean_rrule_for_proton() {
         rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
     fi
 
+	# Se è una ricorrenza DAILY con BYDAY, trasformala in WEEKLY:
+	if [[ "$rrule" =~ FREQ=DAILY && "$rrule" =~ BYDAY= ]]; then
+		# Cambia solo il pezzo FREQ=DAILY -> FREQ=WEEKLY
+		rrule=${rrule/FREQ=DAILY/FREQ=WEEKLY}
+
+		# Se vuoi anche limitare a 3 occorrenze (nel tuo caso specifico):
+		# rrule="$rrule;COUNT=3"
+	fi
+
+
     # Rimuovi BYSETPOS (non supportato)
     rrule=$(echo "$rrule" | sed 's/;BYSETPOS=[^;]*//g' | sed 's/BYSETPOS=[^;]*;//g')
 
