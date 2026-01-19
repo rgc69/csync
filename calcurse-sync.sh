@@ -999,36 +999,68 @@ find_new_events() {
     declare -A proton_uids
     declare -A proton_summaries
     declare -A proton_events_by_key
+    declare -A proton_uid_by_key
+    declare -A proton_summary_by_key
+    declare -A proton_dtstart_by_key
+    declare -A proton_hash_by_key
+    declare -A calcurse_uid_by_key
+    declare -A calcurse_summary_by_key
+    declare -A calcurse_dtstart_by_key
+    declare -A calcurse_hash_by_key
 
     local block="" in_event=0 proton_count=0
+    local uid="" summary="" dtstart=""
 
     # Indicizzazione eventi Proton
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
             block="$line"
             in_event=1
+            uid=""
+            summary=""
+            dtstart=""
         elif [[ "$line" == "END:VEVENT" ]]; then
             block+=$'\n'"$line"
 
             local hash=$(compute_event_hash "$block")
-            proton_hashes["$hash"]=1
-
-            local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
-            [[ -n "$uid" ]] && proton_uids["$uid"]=1
-
-            local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-            local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-            [[ -n "$summary" ]] && proton_summaries["$summary"]="$dtstart"
-
-            # FIX: Usa chiave univoca
             local key=$(generate_event_key "$block")
+            proton_hashes["$hash"]=1
+            proton_hash_by_key["$key"]="$hash"
             proton_events_by_key["$key"]=1
+
+            if [[ -n "$uid" ]]; then
+                proton_uids["$uid"]=1
+                proton_uid_by_key["$key"]="$uid"
+            fi
+            if [[ -n "$summary" ]]; then
+                proton_summaries["$summary"]="$dtstart"
+                proton_summary_by_key["$key"]="$summary"
+            fi
+            [[ -n "$dtstart" ]] && proton_dtstart_by_key["$key"]="$dtstart"
 
             ((proton_count++))
             in_event=0
             block=""
         elif (( in_event )); then
             block+=$'\n'"$line"
+            case "$line" in
+                UID:*)
+                    [[ -z "$uid" ]] && uid="${line#UID:}"
+                    uid="${uid//$'\r'/}"
+                    uid="${uid// /}"
+                    ;;
+                SUMMARY:*)
+                    [[ -z "$summary" ]] && summary="${line#SUMMARY:}"
+                    summary="${summary//$'\r'/}"
+                    ;;
+                DTSTART*)
+                    if [[ -z "$dtstart" ]]; then
+                        dtstart="${line#*:}"
+                        dtstart="${dtstart//$'\r'/}"
+                        dtstart="${dtstart// /}"
+                    fi
+                    ;;
+            esac
         fi
     done < "$proton_tmp"
 
@@ -1040,12 +1072,16 @@ EOF
 
     local new_count=0
     block="" in_event=0
+    uid="" summary="" dtstart=""
 
     # Ricerca nuovi eventi in Calcurse
     while IFS= read -r line; do
         if [[ "$line" == "BEGIN:VEVENT" ]]; then
             block="$line"
             in_event=1
+            uid=""
+            summary=""
+            dtstart=""
         elif [[ "$line" == "END:VEVENT" ]]; then
             block+=$'\n'"$line"
 
@@ -1053,24 +1089,27 @@ EOF
 
             # FIX: Check per chiave univoca PRIMA (priorità massima)
             local key=$(generate_event_key "$block")
+            local hash=$(compute_event_hash "$block")
+            calcurse_hash_by_key["$key"]="$hash"
+            [[ -n "$uid" ]] && calcurse_uid_by_key["$key"]="$uid"
+            [[ -n "$summary" ]] && calcurse_summary_by_key["$key"]="$summary"
+            [[ -n "$dtstart" ]] && calcurse_dtstart_by_key["$key"]="$dtstart"
             if [[ -n "${proton_events_by_key[$key]}" ]]; then
                 is_duplicate=1
             else
                 # Fallback su hash se chiave non matcha
-                local hash=$(compute_event_hash "$block")
                 if [[ -n "${proton_hashes[$hash]}" ]]; then
                     is_duplicate=1
                 else
-                    local uid=$(echo "$block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
-                    if [[ -n "$uid" && -n "${proton_uids[$uid]}" ]]; then
+                    local cached_uid="${calcurse_uid_by_key[$key]}"
+                    local cached_summary="${calcurse_summary_by_key[$key]}"
+                    local cached_dtstart="${calcurse_dtstart_by_key[$key]}"
+                    if [[ -n "$cached_uid" && -n "${proton_uids[$cached_uid]}" ]]; then
                         is_duplicate=1
                     else
-                        local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-                        local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-
-                        if [[ -n "$summary" && -n "${proton_summaries[$summary]}" ]]; then
-                            local proton_dtstart="${proton_summaries[$summary]}"
-                            if [[ "${dtstart:0:8}" == "${proton_dtstart:0:8}" ]]; then
+                        if [[ -n "$cached_summary" && -n "${proton_summaries[$cached_summary]}" ]]; then
+                            local proton_dtstart="${proton_summaries[$cached_summary]}"
+                            if [[ "${cached_dtstart:0:8}" == "${proton_dtstart:0:8}" ]]; then
                                 is_duplicate=1
                             fi
                         fi
@@ -1099,8 +1138,6 @@ EOF
                 echo "$normalized_event" >> "$out_tmp"
                 ((new_count++))
 
-                local summary=$(echo "$block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-                local dtstart=$(echo "$block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
                 echo "➕ New event: $summary ($dtstart)"
             fi
 
@@ -1108,6 +1145,24 @@ EOF
             block=""
         elif (( in_event )); then
             block+=$'\n'"$line"
+            case "$line" in
+                UID:*)
+                    [[ -z "$uid" ]] && uid="${line#UID:}"
+                    uid="${uid//$'\r'/}"
+                    uid="${uid// /}"
+                    ;;
+                SUMMARY:*)
+                    [[ -z "$summary" ]] && summary="${line#SUMMARY:}"
+                    summary="${summary//$'\r'/}"
+                    ;;
+                DTSTART*)
+                    if [[ -z "$dtstart" ]]; then
+                        dtstart="${line#*:}"
+                        dtstart="${dtstart//$'\r'/}"
+                        dtstart="${dtstart// /}"
+                    fi
+                    ;;
+            esac
         fi
     done < "$calcurse_tmp"
 
@@ -1386,14 +1441,18 @@ option_A() {
 
     declare -A calcurse_hashes_map
     declare -A proton_hashes_map
+    declare -A calcurse_hash_by_key
+    declare -A proton_hash_by_key
 
     for key in "${!calcurse_events[@]}"; do
         local hash=$(compute_event_hash "${calcurse_blocks[$key]}")
+        calcurse_hash_by_key["$key"]="$hash"
         calcurse_hashes_map["$hash"]="$key"
     done
 
     for key in "${!proton_events[@]}"; do
         local hash=$(compute_event_hash "${proton_blocks[$key]}")
+        proton_hash_by_key["$key"]="$hash"
         proton_hashes_map["$hash"]="$key"
     done
 
@@ -1566,7 +1625,7 @@ option_A() {
 
             # Check 3: OTTIMIZZATO - Hash lookup O(1)
             if [[ $found_in_calcurse -eq 0 ]]; then
-                local proton_hash=$(compute_event_hash "${proton_blocks[$key]}")
+                local proton_hash="${proton_hash_by_key[$key]}"
                 [[ -n "${calcurse_hashes_map[$proton_hash]}" ]] && found_in_calcurse=1
             fi
         fi
@@ -1631,7 +1690,7 @@ option_A() {
 
             # Check 3: Hash lookup O(1)
             if [[ $found_in_proton -eq 0 ]]; then
-                local calcurse_hash=$(compute_event_hash "${calcurse_blocks[$key]}")
+                local calcurse_hash="${calcurse_hash_by_key[$key]}"
                 [[ -n "${proton_hashes_map[$calcurse_hash]}" ]] && found_in_proton=1
             fi
         fi
