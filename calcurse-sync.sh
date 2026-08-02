@@ -265,6 +265,82 @@ _ics_duration_from_dtstart_dtend() {
     echo "P${days}DT${hours}H${mins}M${secs}S"
 }
 
+
+extract_compatible_display_alarm_trigger() {
+    local event_block="$1"
+    local in_alarm=0
+    local current_trigger=""
+    local current_action=""
+
+    while IFS= read -r line; do
+        case "$line" in
+            "BEGIN:VALARM"*)
+                in_alarm=1
+                current_trigger=""
+                current_action=""
+                ;;
+            "END:VALARM"*)
+                if [[ "${current_action^^}" == "DISPLAY" && -n "$current_trigger" ]]; then
+                    local seconds
+                    seconds=$(convert_trigger_to_seconds "$current_trigger")
+                    if [[ "$seconds" -gt 0 ]]; then
+                        convert_seconds_to_trigger "$seconds" "calcurse"
+                        return 0
+                    fi
+                fi
+                in_alarm=0
+                ;;
+            TRIGGER*)
+                if [[ $in_alarm -eq 1 && "$line" != *"RELATED=END"* ]]; then
+                    current_trigger="${line#*:}"
+                fi
+                ;;
+            ACTION:*)
+                if [[ $in_alarm -eq 1 ]]; then
+                    current_action="${line#ACTION:}"
+                fi
+                ;;
+        esac
+    done < <(echo "$event_block" | tr -d '\r')
+
+    echo ""
+}
+
+event_is_timed() {
+    local event_block="$1"
+    local dtstart_line
+    dtstart_line=$(echo "$event_block" | tr -d '\r' | grep -m1 "^DTSTART")
+
+    [[ -n "$dtstart_line" ]] || return 1
+    [[ "$dtstart_line" != *"VALUE=DATE"* ]] || return 1
+
+    local value="${dtstart_line#*:}"
+    [[ "$value" == *"T"* ]]
+}
+
+add_display_alarm_to_event() {
+    local event_block="$1"
+    local trigger="$2"
+
+    if [[ -n "$(extract_compatible_display_alarm_trigger "$event_block")" ]]; then
+        echo "$event_block"
+        return 0
+    fi
+
+    local out=""
+    while IFS= read -r line; do
+        if [[ "$line" == "END:VEVENT" ]]; then
+            out+="BEGIN:VALARM"$'\n'
+            out+="TRIGGER:${trigger}"$'\n'
+            out+="ACTION:DISPLAY"$'\n'
+            out+="END:VALARM"$'\n'
+        fi
+        out+="$line"$'\n'
+    done < <(echo "$event_block")
+
+    echo "${out%$'\n'}"
+}
+
 sanitize_vevent_for_calcurse() {
     # Produce a minimal, calcurse-friendly VEVENT:
     # - Remove TZID params from DTSTART/DTEND/EXDATE
@@ -278,45 +354,16 @@ sanitize_vevent_for_calcurse() {
     local dtstart_raw="" dtend_raw="" duration_raw=""
     local rrule_raw=""
     local exdate_raw_list=()
-    local alarm_trigger=""
-    local current_alarm_trigger=""
-    local current_alarm_action=""
+    local alarm_trigger
+    alarm_trigger=$(extract_compatible_display_alarm_trigger "$block")
 
     local in_alarm=0
     while IFS= read -r line; do
         case "$line" in
-            "BEGIN:VALARM"*)
-                in_alarm=1
-                current_alarm_trigger=""
-                current_alarm_action=""
-                continue
-                ;;
-            "END:VALARM"*)
-                if [[ -z "$alarm_trigger" ]] && \
-                   [[ "${current_alarm_action^^}" == "DISPLAY" ]] && \
-                   [[ -n "$current_alarm_trigger" ]]; then
-                    local alarm_seconds
-                    alarm_seconds=$(convert_trigger_to_seconds "$current_alarm_trigger")
-                    if [[ "$alarm_seconds" -gt 0 ]]; then
-                        alarm_trigger=$(convert_seconds_to_trigger "$alarm_seconds" "calcurse")
-                    fi
-                fi
-                in_alarm=0
-                continue
-                ;;
+            "BEGIN:VALARM"*) in_alarm=1; continue ;;
+            "END:VALARM"*) in_alarm=0; continue ;;
         esac
-
-        if [[ $in_alarm -eq 1 ]]; then
-            case "$line" in
-                TRIGGER*)
-                    if [[ "$line" != *"RELATED=END"* ]]; then
-                        current_alarm_trigger="${line#*:}"
-                    fi
-                    ;;
-                ACTION:*) current_alarm_action="${line#ACTION:}" ;;
-            esac
-            continue
-        fi
+        [[ $in_alarm -eq 1 ]] && continue
 
         case "$line" in
             UID:*) uid="${line#UID:}" ;;
@@ -439,7 +486,7 @@ sanitize_vevent_for_calcurse() {
     [[ -n "$summary" ]] && out+="SUMMARY:${summary}"$'\n'
     [[ -n "$location" ]] && out+="LOCATION:${location}"$'\n'
     [[ -n "$description" ]] && out+="DESCRIPTION:${description}"$'\n'
-    if [[ -n "$alarm_trigger" ]]; then
+    if [[ $is_allday -eq 0 && -n "$alarm_trigger" ]]; then
         out+="BEGIN:VALARM"$'\n'
         out+="TRIGGER:${alarm_trigger}"$'\n'
         out+="ACTION:DISPLAY"$'\n'
@@ -1920,6 +1967,111 @@ option_A() {
         fi
     done
 
+    # Find matched timed appointments that have a compatible Proton alarm but
+    # no Calcurse notification. Events already scheduled for replacement are
+    # excluded because importing the Proton block will carry the alarm.
+    declare -A alarm_backfill_candidates
+    declare -A alarm_backfills_to_apply
+    declare -A scheduled_calcurse_deletions
+    declare -A scheduled_proton_imports
+
+    for ckey in "${events_to_delete_from_calcurse[@]}"; do
+        scheduled_calcurse_deletions["$ckey"]=1
+    done
+    for pkey in "${events_to_import_to_calcurse[@]}"; do
+        scheduled_proton_imports["$pkey"]=1
+    done
+
+    for pkey in "${!proton_events[@]}"; do
+        local pblock="${proton_blocks[$pkey]}"
+        event_is_timed "$pblock" || continue
+
+        local proton_alarm_trigger
+        proton_alarm_trigger=$(extract_compatible_display_alarm_trigger "$pblock")
+        [[ -n "$proton_alarm_trigger" ]] || continue
+
+        local ckey=""
+        if [[ -n "${calcurse_events[$pkey]}" ]]; then
+            ckey="$pkey"
+        else
+            local puid
+            puid=$(echo "$pblock" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+            if [[ -n "$puid" && -n "${calcurse_uids_to_keys[$puid]}" ]]; then
+                ckey="${calcurse_uids_to_keys[$puid]}"
+            fi
+        fi
+
+        if [[ -z "$ckey" ]] && echo "$pblock" | grep -q "^RRULE:"; then
+            local psig
+            psig=$(generate_recurrence_signature "$pblock")
+            [[ -n "${calcurse_sig_to_key[$psig]}" ]] && ckey="${calcurse_sig_to_key[$psig]}"
+        fi
+
+        if [[ -z "$ckey" ]]; then
+            local proton_hash="${proton_hash_by_key[$pkey]}"
+            [[ -n "${calcurse_hashes_map[$proton_hash]}" ]] && ckey="${calcurse_hashes_map[$proton_hash]}"
+        fi
+
+        [[ -n "$ckey" ]] || continue
+        [[ -z "${scheduled_calcurse_deletions[$ckey]}" ]] || continue
+        [[ -z "${scheduled_proton_imports[$pkey]}" ]] || continue
+
+        local calcurse_alarm_trigger
+        calcurse_alarm_trigger=$(extract_compatible_display_alarm_trigger "${calcurse_blocks[$ckey]}")
+        [[ -z "$calcurse_alarm_trigger" ]] || continue
+
+        alarm_backfill_candidates["$ckey"]="${pkey}${us}${proton_alarm_trigger}"
+    done
+
+    if [[ ${#alarm_backfill_candidates[@]} -gt 0 ]]; then
+        echo ""
+        echo "🔔 Found ${#alarm_backfill_candidates[@]} matching appointment(s) with a missing Calcurse notification"
+        echo "   Calcurse will use its global notification.warning value."
+        echo ""
+        echo "   A) Add all missing notifications"
+        echo "   R) Review appointments individually"
+        echo "   S) Skip notification backfill"
+        echo ""
+        read -rp "   Choice (A/R/S): " alarm_backfill_choice
+
+        case "${alarm_backfill_choice^^}" in
+            A)
+                for ckey in "${!alarm_backfill_candidates[@]}"; do
+                    local candidate="${alarm_backfill_candidates[$ckey]}"
+                    alarm_backfills_to_apply["$ckey"]="${candidate#*${us}}"
+                done
+                ;;
+            R)
+                for ckey in "${!alarm_backfill_candidates[@]}"; do
+                    local candidate="${alarm_backfill_candidates[$ckey]}"
+                    local candidate_pkey="${candidate%%${us}*}"
+                    local candidate_trigger="${candidate#*${us}}"
+                    local pval="${proton_events[$candidate_pkey]}"
+                    local candidate_summary="${pval%%||*}"
+                    local dtstart_line
+                    dtstart_line=$(echo "${proton_blocks[$candidate_pkey]}" | grep -m1 "^DTSTART")
+                    local candidate_start
+                    candidate_start=$(_norm_dt_token_common "$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' )")
+
+                    echo ""
+                    echo "   📝 ${candidate_summary:-[No title]}"
+                    echo "   📅 $candidate_start"
+                    read -rp "   Add Calcurse notification? (y/N): " add_alarm_choice
+                    if [[ "$add_alarm_choice" =~ ^[sSyY]$ ]]; then
+                        alarm_backfills_to_apply["$ckey"]="$candidate_trigger"
+                    fi
+                done
+                ;;
+            *)
+                echo "   ⏭️  Notification backfill skipped"
+                ;;
+        esac
+
+        if [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]]; then
+            echo "   ✅ Will add ${#alarm_backfills_to_apply[@]} Calcurse notification(s)"
+        fi
+    fi
+
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
@@ -1927,7 +2079,8 @@ option_A() {
     # Riepilogo decisioni
     if [[ ${#events_to_import_to_calcurse[@]} -eq 0 ]] && \
        [[ ${#events_to_delete_from_calcurse[@]} -eq 0 ]] && \
-       [[ ${#events_to_export_to_proton[@]} -eq 0 ]]; then
+       [[ ${#events_to_export_to_proton[@]} -eq 0 ]] && \
+       [[ ${#alarm_backfills_to_apply[@]} -eq 0 ]]; then
         echo "✅ No changes to apply. The calendars are synchronized!"
         rm -f "$proton_tmp" "$calcurse_tmp"
         return 0
@@ -1966,6 +2119,11 @@ option_A() {
         echo ""
     fi
 
+    if [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]]; then
+        echo "🔔 Missing notifications to add: ${#alarm_backfills_to_apply[@]}"
+        echo ""
+    fi
+
     read -rp "Do you confirm applying these changes? (y/N): " confirm
 
     if [[ ! "$confirm" =~ ^[sSyY]$ ]]; then
@@ -1982,7 +2140,8 @@ option_A() {
 
     # Apply every Calcurse-side decision as one validated database replacement.
     if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]] || \
-       [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
+       [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]] || \
+       [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]]; then
         echo ""
         echo "🔄 Preparing atomic Calcurse update..."
 
@@ -2009,6 +2168,7 @@ option_A() {
         local kept_count=0
         local deleted_count=0
         local imported_count=0
+        local backfilled_count=0
 
         while IFS= read -r line; do
             if [[ "$line" == "BEGIN:VEVENT" ]]; then
@@ -2022,6 +2182,10 @@ option_A() {
                 current_key=$(generate_event_key "$block")
 
                 if [[ -z "${to_delete[$current_key]}" ]]; then
+                    if [[ -n "${alarm_backfills_to_apply[$current_key]}" ]]; then
+                        block=$(add_display_alarm_to_event "$block" "${alarm_backfills_to_apply[$current_key]}")
+                        ((backfilled_count++))
+                    fi
                     printf '%s\n' "$block" >> "$target_calendar"
                     ((kept_count++))
                 else
@@ -2047,6 +2211,7 @@ option_A() {
         echo "  - Existing events kept: $kept_count"
         echo "  - Existing events deleted: $deleted_count"
         echo "  - Proton events imported: $imported_count"
+        echo "  - Notifications added: $backfilled_count"
 
         if ! replace_calcurse_events_atomically "$target_calendar"; then
             rm -f "$target_calendar"
@@ -2099,7 +2264,9 @@ option_A() {
     fi
 
     # Aggiorna export
-    if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]] || [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
+    if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]] || \
+       [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]] || \
+       [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]]; then
         echo ""
         echo "🔄 Updating Calcurse export..."
         export_calcurse_with_uids
@@ -2117,6 +2284,7 @@ option_A() {
     echo "📊 Summary:"
     echo "   • Events imported into Calcurse: ${#events_to_import_to_calcurse[@]}"
     echo "   • Events deleted from Calcurse: ${#events_to_delete_from_calcurse[@]}"
+    echo "   • Notifications added to Calcurse: ${#alarm_backfills_to_apply[@]}"
     echo "   • Events to import into Proton: ${#events_to_export_to_proton[@]}"
     echo ""
     echo "💾 Backup available: $BACKUP_FILE"

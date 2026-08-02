@@ -96,10 +96,10 @@ Calcurse: FREQ=WEEKLY;UNTIL=20251020T115000;BYDAY=TU,TH
 Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
 ```
 
-**Stored hashes:**
-1. Normalized content (comparison)
-2. Summary + UID (display)
-3. Alarms rounded to 5min (comparison)
+**Comparison data:**
+1. Normalized content hash, excluding alarms and `EXDATE`
+2. Summary and UID for matching and display
+3. `EXDATE` and compatible display-alarm presence handled separately
 
 ### Alarm Conversion
 
@@ -112,6 +112,10 @@ Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
   preserved.
 - **Calcurse → Proton**: exports one display alarm rounded to a standard
   interval (5, 10, 15, 30, 60, 120, or 1440 minutes).
+- During **Option A**, matching timed appointments that have a compatible
+  Proton display alarm but no Calcurse notification can be backfilled in one
+  batch or reviewed individually. This backfill only adds missing
+  notifications; it does not remove or compare existing notification settings.
 
 ## 📊 Example (Option A)
 
