@@ -85,6 +85,22 @@ complete target calendar in a temporary Calcurse database. The real `apts`
 file is replaced only after a successful import with the expected event count.
 Failed imports leave the existing appointments and TODO items unchanged.
 
+### Integration Tests
+
+Run the isolated end-to-end suite with:
+
+```bash
+bash tests/run.sh
+```
+
+The suite requires `calcurse` and creates a separate temporary home and data
+directory for every scenario. It never reads or modifies the user's Calcurse
+database. Set `KEEP_TEST_TMP=1` to retain the temporary files after a run.
+
+Covered flows include guided import and export, second-pass idempotence,
+recurring-event `EXDATE` updates, compatible alarm backfill, unsupported alarm
+filters, and atomic failure preservation for appointments and TODO items.
+
 ### Event Normalization
 
 The script normalizes events for accurate comparison:
