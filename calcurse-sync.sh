@@ -270,7 +270,7 @@ sanitize_vevent_for_calcurse() {
     # - Remove TZID params from DTSTART/DTEND/EXDATE
     # - Normalize EXDATE type/format (DATE vs DATE-TIME)
     # - Convert DTEND -> DURATION for timed events (more reliable with calcurse)
-    # - Drop VALARM blocks entirely (calcurse import is picky)
+    # - Keep the first compatible DISPLAY alarm (Calcurse supports one notification)
     # - Keep ordering stable with DTSTART early
     local block="$1"
 
@@ -278,14 +278,45 @@ sanitize_vevent_for_calcurse() {
     local dtstart_raw="" dtend_raw="" duration_raw=""
     local rrule_raw=""
     local exdate_raw_list=()
+    local alarm_trigger=""
+    local current_alarm_trigger=""
+    local current_alarm_action=""
 
     local in_alarm=0
     while IFS= read -r line; do
         case "$line" in
-            "BEGIN:VALARM"*) in_alarm=1; continue ;;
-            "END:VALARM"*) in_alarm=0; continue ;;
+            "BEGIN:VALARM"*)
+                in_alarm=1
+                current_alarm_trigger=""
+                current_alarm_action=""
+                continue
+                ;;
+            "END:VALARM"*)
+                if [[ -z "$alarm_trigger" ]] && \
+                   [[ "${current_alarm_action^^}" == "DISPLAY" ]] && \
+                   [[ -n "$current_alarm_trigger" ]]; then
+                    local alarm_seconds
+                    alarm_seconds=$(convert_trigger_to_seconds "$current_alarm_trigger")
+                    if [[ "$alarm_seconds" -gt 0 ]]; then
+                        alarm_trigger=$(convert_seconds_to_trigger "$alarm_seconds" "calcurse")
+                    fi
+                fi
+                in_alarm=0
+                continue
+                ;;
         esac
-        [[ $in_alarm -eq 1 ]] && continue
+
+        if [[ $in_alarm -eq 1 ]]; then
+            case "$line" in
+                TRIGGER*)
+                    if [[ "$line" != *"RELATED=END"* ]]; then
+                        current_alarm_trigger="${line#*:}"
+                    fi
+                    ;;
+                ACTION:*) current_alarm_action="${line#ACTION:}" ;;
+            esac
+            continue
+        fi
 
         case "$line" in
             UID:*) uid="${line#UID:}" ;;
@@ -408,6 +439,12 @@ sanitize_vevent_for_calcurse() {
     [[ -n "$summary" ]] && out+="SUMMARY:${summary}"$'\n'
     [[ -n "$location" ]] && out+="LOCATION:${location}"$'\n'
     [[ -n "$description" ]] && out+="DESCRIPTION:${description}"$'\n'
+    if [[ -n "$alarm_trigger" ]]; then
+        out+="BEGIN:VALARM"$'\n'
+        out+="TRIGGER:${alarm_trigger}"$'\n'
+        out+="ACTION:DISPLAY"$'\n'
+        out+="END:VALARM"$'\n'
+    fi
     out+="END:VEVENT"
 
     echo "$out"

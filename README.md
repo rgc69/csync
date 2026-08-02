@@ -103,8 +103,15 @@ Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
 
 ### Alarm Conversion
 
-- **Proton → Calcurse**: `-P{seconds}S`
-- **Calcurse → Proton**: rounded to standard intervals (5, 10, 15, 30, 60, 120, 1440 min)
+- **Proton → Calcurse**: keeps the first compatible `ACTION:DISPLAY` alarm
+  for each timed appointment and converts its relative trigger to seconds.
+- Additional alarms and `ACTION:EMAIL` are ignored. Calcurse does not retain
+  alarms on all-day events.
+- Calcurse stores a notification flag per appointment and applies the global
+  `notification.warning` value, so Proton's per-event lead times are not
+  preserved.
+- **Calcurse → Proton**: exports one display alarm rounded to a standard
+  interval (5, 10, 15, 30, 60, 120, or 1440 minutes).
 
 ## 📊 Example (Option A)
 
