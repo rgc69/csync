@@ -447,6 +447,137 @@ sanitize_calendar_for_calcurse_import() {
 }
 
 
+count_vevents() {
+    local input_file="$1"
+
+    awk '
+        {
+            sub(/\r$/, "", $0)
+            if ($0 == "BEGIN:VEVENT") {
+                count++
+            }
+        }
+        END {
+            print count + 0
+        }
+    ' "$input_file"
+}
+
+replace_calcurse_events_atomically() {
+    local input_file="$1"
+
+    [[ -f "$input_file" ]] || {
+        echo "❌ Atomic import source not found: $input_file" >&2
+        return 1
+    }
+    [[ -d "$CALCURSE_DIR" ]] || {
+        echo "❌ Calcurse data directory not found: $CALCURSE_DIR" >&2
+        return 1
+    }
+
+    local staging_root
+    staging_root=$(mktemp -d "${TMPDIR:-/tmp}/calcurse-sync.XXXXXX") || return 1
+
+    local staging_dir="$staging_root/calcurse"
+    local sanitized_file="$staging_root/import.ics"
+    local staged_export="$staging_root/export.ics"
+    local replacement_file=""
+
+    mkdir -p "$staging_dir" || {
+        rm -rf "$staging_root"
+        return 1
+    }
+
+    if ! cp -a "$CALCURSE_DIR/." "$staging_dir/"; then
+        echo "❌ Unable to create the temporary Calcurse database" >&2
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    : > "$staging_dir/apts" || {
+        echo "❌ Unable to initialize the temporary appointment database" >&2
+        rm -rf "$staging_root"
+        return 1
+    }
+
+    if ! sanitize_calendar_for_calcurse_import "$input_file" "$sanitized_file"; then
+        echo "❌ Unable to sanitize the calendar for the temporary import" >&2
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    local source_count sanitized_count imported_count
+    source_count=$(count_vevents "$input_file")
+    sanitized_count=$(count_vevents "$sanitized_file")
+
+    if [[ "$source_count" -ne "$sanitized_count" ]]; then
+        echo "❌ Sanitization changed the event count ($source_count → $sanitized_count)" >&2
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    echo "🧪 Importing and validating $source_count event(s) in a temporary database..."
+    if ! calcurse -D "$staging_dir" -i "$sanitized_file"; then
+        echo "❌ Temporary import failed; the original database was not changed" >&2
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    if ! calcurse -D "$staging_dir" --export > "$staged_export"; then
+        echo "❌ Unable to validate the temporary Calcurse database" >&2
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    imported_count=$(count_vevents "$staged_export")
+    if [[ "$imported_count" -ne "$source_count" ]]; then
+        echo "❌ Temporary import validation failed: expected $source_count event(s), found $imported_count" >&2
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    # Notes are content-addressed. Copy them before the atomic apts switch;
+    # at worst a failed switch leaves harmless, unreferenced note files.
+    if [[ -d "$staging_dir/notes" ]]; then
+        mkdir -p "$CALCURSE_DIR/notes" || {
+            rm -rf "$staging_root"
+            return 1
+        }
+        if ! cp -a "$staging_dir/notes/." "$CALCURSE_DIR/notes/"; then
+            echo "❌ Unable to copy appointment notes from the temporary database" >&2
+            rm -rf "$staging_root"
+            return 1
+        fi
+    fi
+
+    replacement_file=$(mktemp "$CALCURSE_DIR/.apts.calcurse-sync.XXXXXX") || {
+        rm -rf "$staging_root"
+        return 1
+    }
+
+    if ! cp "$staging_dir/apts" "$replacement_file"; then
+        echo "❌ Unable to prepare the validated appointment database" >&2
+        rm -f "$replacement_file"
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    if [[ -f "$CALCURSE_DIR/apts" ]]; then
+        chmod --reference="$CALCURSE_DIR/apts" "$replacement_file" 2>/dev/null || true
+    fi
+
+    if ! mv -f "$replacement_file" "$CALCURSE_DIR/apts"; then
+        echo "❌ Unable to activate the validated appointment database" >&2
+        rm -f "$replacement_file"
+        rm -rf "$staging_root"
+        return 1
+    fi
+
+    rm -rf "$staging_root"
+    echo "✅ Validated appointment database activated atomically"
+}
+
+
 # ----------------------------------------------------------------------
 # PULIZIA RRULE PER COMPATIBILITÀ PROTON
 # ----------------------------------------------------------------------
@@ -1812,134 +1943,82 @@ option_A() {
     calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup failed"
     echo "✅ Backup saved: $BACKUP_FILE"
 
-# FASE 1: Elimina eventi da Calcurse (tramite re-import filtrato)
-if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]]; then
-    echo ""
-    echo "🗑️  Deleting ${#events_to_delete_from_calcurse[@]} events from Calcurse..."
+    # Apply every Calcurse-side decision as one validated database replacement.
+    if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]] || \
+       [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
+        echo ""
+        echo "🔄 Preparing atomic Calcurse update..."
 
-    declare -A to_delete
-    for key in "${events_to_delete_from_calcurse[@]}"; do
-        to_delete["$key"]=1
-        echo "  -> [$key]"
-    done
+        declare -A to_delete
+        declare -A to_import
 
-    # Esporta TODO separatamente per preservarli
-    local todo_backup=$(mktemp)
-    calcurse -D "$CALCURSE_DIR" -t --export-uid > "$todo_backup" 2>/dev/null || true
+        for key in "${events_to_delete_from_calcurse[@]}"; do
+            to_delete["$key"]=1
+        done
+        for key in "${events_to_import_to_calcurse[@]}"; do
+            to_import["$key"]=1
+        done
 
-    # Esporta SOLO appuntamenti (no TODO)
-    local current_export=$(mktemp)
-    awk '/^BEGIN:VTODO/,/^END:VTODO/ {next} 1' "$EXPORT_FILE" > "$current_export"
+        local target_calendar
+        target_calendar=$(mktemp) || die "Unable to create temporary target calendar"
 
-    local filtered_temp=$(mktemp)
-    echo "BEGIN:VCALENDAR" > "$filtered_temp"
-    echo "VERSION:2.0" >> "$filtered_temp"
-    echo "PRODID:-//calcurse-sync//Filtered//" >> "$filtered_temp"
+        echo "BEGIN:VCALENDAR" > "$target_calendar"
+        echo "VERSION:2.0" >> "$target_calendar"
+        echo "PRODID:-//calcurse-sync//Atomic target//" >> "$target_calendar"
 
-    block=""
-    in_event=0
-    local event_count=0
-    local kept_count=0
-    local deleted_count=0
+        block=""
+        in_event=0
+        local event_count=0
+        local kept_count=0
+        local deleted_count=0
+        local imported_count=0
 
-    while IFS= read -r line; do
-        if [[ "$line" == "BEGIN:VEVENT" ]]; then
-            block="$line"
-            in_event=1
-        elif [[ "$line" == "END:VEVENT" ]]; then
-            block+=$'\n'"$line"
-            ((event_count++))
+        while IFS= read -r line; do
+            if [[ "$line" == "BEGIN:VEVENT" ]]; then
+                block="$line"
+                in_event=1
+            elif [[ "$line" == "END:VEVENT" ]]; then
+                block+=$'\n'"$line"
+                ((event_count++))
 
-            local key=$(generate_event_key "$block")
+                local current_key
+                current_key=$(generate_event_key "$block")
 
-            # Includi solo se NON è nella lista da eliminare
-            if [[ -z "${to_delete[$key]}" ]]; then
-                echo "$block" >> "$filtered_temp"
-                ((kept_count++))
-            else
-                ((deleted_count++))
+                if [[ -z "${to_delete[$current_key]}" ]]; then
+                    printf '%s\n' "$block" >> "$target_calendar"
+                    ((kept_count++))
+                else
+                    ((deleted_count++))
+                fi
+
+                in_event=0
+                block=""
+            elif (( in_event )); then
+                block+=$'\n'"$line"
             fi
+        done < "$calcurse_tmp"
 
-            in_event=0
-            block=""
-        elif (( in_event )); then
-            block+=$'\n'"$line"
-        else
-            [[ "$line" =~ ^(BEGIN|VERSION|PRODID|CALSCALE|END):.*$ ]] && continue
-            echo "$line" >> "$filtered_temp"
+        for key in "${!to_import[@]}"; do
+            printf '%s\n' "${proton_blocks[$key]}" >> "$target_calendar"
+            ((imported_count++))
+        done
+
+        echo "END:VCALENDAR" >> "$target_calendar"
+
+        echo "Processing summary:"
+        echo "  - Existing events processed: $event_count"
+        echo "  - Existing events kept: $kept_count"
+        echo "  - Existing events deleted: $deleted_count"
+        echo "  - Proton events imported: $imported_count"
+
+        if ! replace_calcurse_events_atomically "$target_calendar"; then
+            rm -f "$target_calendar"
+            die "Atomic Calcurse update failed; the original database is unchanged"
         fi
-    done < "$current_export"
 
-    echo "END:VCALENDAR" >> "$filtered_temp"
-
-    echo "Processing summary:"
-    echo "  - Total events processed: $event_count"
-    echo "  - Events kept: $kept_count"
-    echo "  - Events deleted: $deleted_count"
-
-    # CRITICAL: Cancella database Calcurse
-    echo "🗑️  Clearing Calcurse database..."
-    # BACKUP TODO PRIMA DI SVUOTARE
-    local todo_backup=$(mktemp)
-    if [ -f "$CALCURSE_DIR/todo" ]; then
-        cp "$CALCURSE_DIR/todo" "$todo_backup"
-        echo "✓ TODO backed up"
+        rm -f "$target_calendar"
+        echo "✅ Calcurse update completed"
     fi
-
-    rm -f "$CALCURSE_DIR/apts" "$CALCURSE_DIR/todo"
-
-    # Re-import eventi filtrati in database vuoto
-    # Sanitize before import (EXDATE/TZID/order) to avoid calcurse strictness issues
-local filtered_sanitized=$(mktemp)
-sanitize_calendar_for_calcurse_import "$filtered_temp" "$filtered_sanitized"
-
-calcurse -D "$CALCURSE_DIR" -i "$filtered_sanitized" || die "Import failed"
-
-rm -f "$filtered_sanitized"
-
-    # Re-import TODO se esistevano
-    if [[ -s "$todo_backup" ]]; then
-        calcurse -D "$CALCURSE_DIR" -i "$todo_backup" 2>/dev/null || true
-    fi
-
-    # RIPRISTINA TODO
-    if [ -f "$todo_backup" ]; then
-        cp "$todo_backup" "$CALCURSE_DIR/todo"
-        rm -f "$todo_backup"
-        echo "✓ TODO restored"
-    fi
-
-    rm -f "$current_export" "$filtered_temp" "$todo_backup"
-    echo "✅ Deletion completed"
-fi
-# FASE 2: Importa eventi da Proton a Calcurse DOPO
-if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]]; then
-    echo ""
-    echo "📥 Importing ${#events_to_import_to_calcurse[@]} events from Proton to Calcurse..."
-
-    local import_temp=$(mktemp)
-    echo "BEGIN:VCALENDAR" > "$import_temp"
-    echo "VERSION:2.0" >> "$import_temp"
-    echo "PRODID:-//calcurse-sync//Import da Proton//" >> "$import_temp"
-
-    for key in "${events_to_import_to_calcurse[@]}"; do
-        local sanitized=$(sanitize_event_block_for_calcurse "${proton_blocks[$key]}")
-        local normalized=$(normalize_alarms "$sanitized" "calcurse")
-        echo "$normalized" >> "$import_temp"
-    done
-
-    echo "END:VCALENDAR" >> "$import_temp"
-
-    # Sanitize the import file as well (Proton often includes TZID on EXDATE/DTSTART)
-local import_sanitized=$(mktemp)
-sanitize_calendar_for_calcurse_import "$import_temp" "$import_sanitized"
-
-calcurse -D "$CALCURSE_DIR" -i "$import_sanitized" || die "Import failed"
-
-rm -f "$import_sanitized"
-    rm -f "$import_temp"
-    echo "✅ Import completed"
-fi
     # FASE 3: Genera file per export a Proton
     if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
         echo ""
@@ -2341,15 +2420,10 @@ option_F() {
     echo "💾 Backup in $BACKUP_FILE..."
     calcurse -D "$CALCURSE_DIR" --export > "$BACKUP_FILE" || die "Backup failed"
 
-    echo "🗑️ Emptying Calcurse..."
-    > "$CALCURSE_DIR/apts"
-
-    echo "📥 Importing everything from Proton..."
-    # Import a sanitized copy to avoid TZID/EXDATE issues
-local proton_sanitized=$(mktemp)
-sanitize_calendar_for_calcurse_import "$IMPORT_FILE" "$proton_sanitized"
-calcurse -D "$CALCURSE_DIR" -i "$proton_sanitized" || die "Import failed"
-rm -f "$proton_sanitized"
+    echo "📥 Importing and validating everything from Proton..."
+    if ! replace_calcurse_events_atomically "$IMPORT_FILE"; then
+        die "Complete synchronization failed; the original database is unchanged"
+    fi
 
     export_calcurse_with_uids
     clean_old_backups

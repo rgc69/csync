@@ -78,6 +78,13 @@ When you run `csync`, you’ll see:
 
 ## 🔧 Technical Notes
 
+### Atomic Calcurse Updates
+
+Before replacing Calcurse appointments, the script imports and validates the
+complete target calendar in a temporary Calcurse database. The real `apts`
+file is replaced only after a successful import with the expected event count.
+Failed imports leave the existing appointments and TODO items unchanged.
+
 ### Event Normalization
 
 The script normalizes events for accurate comparison:
