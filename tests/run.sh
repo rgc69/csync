@@ -182,6 +182,7 @@ test_calcurse_export() {
     assert_status 0 || return 1
     assert_line_count 1 "BEGIN:VEVENT" "$backup_dir/nuovi-appuntamenti-calcurse.ics" || return 1
     assert_contains "$backup_dir/nuovi-appuntamenti-calcurse.ics" "SUMMARY:Calcurse New Event" || return 1
+    assert_contains "$backup_dir/nuovi-appuntamenti-calcurse.ics" "UID:CALCURSE-" || return 1
 }
 
 test_recurring_exdate_and_alarm() {

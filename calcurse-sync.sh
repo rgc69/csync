@@ -57,7 +57,7 @@ convert_trigger_to_seconds() {
     local trigger="$1"
     local seconds=0
 
-    trigger=$(echo "$trigger" | tr -d '[:space:]')
+    trigger="${trigger//[[:space:]]/}"
 
     if [[ $trigger =~ ^-P([0-9]+)D$ ]]; then
         seconds=$(( ${BASH_REMATCH[1]} * 86400 ))
@@ -273,6 +273,7 @@ extract_compatible_display_alarm_trigger() {
     local current_action=""
 
     while IFS= read -r line; do
+        line="${line%$'\r'}"
         case "$line" in
             "BEGIN:VALARM"*)
                 in_alarm=1
@@ -301,21 +302,21 @@ extract_compatible_display_alarm_trigger() {
                 fi
                 ;;
         esac
-    done < <(echo "$event_block" | tr -d '\r')
+    done <<< "$event_block"
 
     echo ""
 }
 
 event_is_timed() {
     local event_block="$1"
-    local dtstart_line
-    dtstart_line=$(echo "$event_block" | tr -d '\r' | grep -m1 "^DTSTART")
-
-    [[ -n "$dtstart_line" ]] || return 1
-    [[ "$dtstart_line" != *"VALUE=DATE"* ]] || return 1
-
-    local value="${dtstart_line#*:}"
-    [[ "$value" == *"T"* ]]
+    local line
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ "$line" == DTSTART* ]] || continue
+        [[ "$line" != *"VALUE=DATE"* && "${line#*:}" == *"T"* ]]
+        return
+    done <<< "$event_block"
+    return 1
 }
 
 add_display_alarm_to_event() {
@@ -904,16 +905,26 @@ generate_event_uid() {
     local event_block="$1"
     local source_system="$2"
 
-    local dtstart=$(echo "$event_block" | grep "^DTSTART" | head -1 | sed 's/^DTSTART[^:]*://' | tr -d '\r\n')
-    local summary=$(echo "$event_block" | grep "^SUMMARY:" | head -1 | cut -d: -f2- | tr -d '\r\n')
-    local description=$(echo "$event_block" | grep "^DESCRIPTION:" | head -1 | cut -d: -f2- | tr -d '\r\n')
-    local duration=$(echo "$event_block" | grep "^DURATION:" | head -1 | cut -d: -f2- | tr -d '\r\n')
-    local dtend=$(echo "$event_block" | grep "^DTEND" | head -1 | sed 's/^DTEND[^:]*://' | tr -d '\r\n')
+    local dtstart="" summary="" description="" duration="" dtend=""
+    local line
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        case "$line" in
+            DTSTART*) [[ -z "$dtstart" ]] && dtstart="${line#*:}" ;;
+            SUMMARY:*) [[ -z "$summary" ]] && summary="${line#SUMMARY:}" ;;
+            DESCRIPTION:*) [[ -z "$description" ]] && description="${line#DESCRIPTION:}" ;;
+            DURATION:*) [[ -z "$duration" ]] && duration="${line#DURATION:}" ;;
+            DTEND*) [[ -z "$dtend" ]] && dtend="${line#*:}" ;;
+        esac
+    done <<< "$event_block"
 
     local uid_base="${source_system}|${dtstart}|${summary}|${description}|${duration}|${dtend}"
-    local uid_hash=$(echo -n "$uid_base" | sha256sum | cut -d' ' -f1 | head -c 16)
+    local uid_hash
+    uid_hash=$(printf '%s' "$uid_base" | sha256sum)
+    uid_hash="${uid_hash%% *}"
+    uid_hash="${uid_hash:0:16}"
 
-    echo "CALCURSE-${uid_hash}@$(hostname)"
+    echo "CALCURSE-${uid_hash}@${HOSTNAME:-localhost}"
 }
 
 # ----------------------------------------------------------------------
@@ -923,13 +934,20 @@ generate_event_uid() {
 generate_event_key() {
     local event_block="$1"
 
-    local dtstart=$(echo "$event_block" | grep -m1 "^DTSTART" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
-    local summary=$(echo "$event_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-    local rrule=$(echo "$event_block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
+    local dtstart="" summary="" rrule="" uid="" line
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        case "$line" in
+            DTSTART*) [[ -z "$dtstart" ]] && dtstart="${line#*:}" ;;
+            SUMMARY:*) [[ -z "$summary" ]] && summary="${line#SUMMARY:}" ;;
+            RRULE:*) [[ -z "$rrule" ]] && rrule="${line#RRULE:}" ;;
+            UID:*) [[ -z "$uid" ]] && uid="${line#UID:}" ;;
+        esac
+    done <<< "$event_block"
 
+    dtstart="${dtstart//[[:space:]]/}"
+    uid="${uid//[[:space:]]/}"
     [[ -n "$rrule" ]] && rrule=$(normalize_rrule_for_comparison "$rrule")
-
-    local uid=$(echo "$event_block" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
 
     if [[ -n "$uid" ]]; then
         echo "UID:${uid}"
@@ -953,7 +971,13 @@ export_calcurse_with_uids() {
 
     for conf_path in "${conf_paths[@]}"; do
         if [[ -f "$conf_path" ]]; then
-            notification_warning=$(grep "^notification.warning=" "$conf_path" 2>/dev/null | cut -d= -f2)
+            local conf_line
+            while IFS= read -r conf_line; do
+                if [[ "$conf_line" == notification.warning=* ]]; then
+                    notification_warning="${conf_line#notification.warning=}"
+                    break
+                fi
+            done < "$conf_path"
             if [[ -n "$notification_warning" ]]; then
                 break
             fi
@@ -973,13 +997,13 @@ export_calcurse_with_uids() {
             event_block+=$'\n'"$line"
 
             # Sostituisci -P300S con il valore configurato
-            event_block=$(echo "$event_block" | sed "s/TRIGGER:-P300S/TRIGGER:-P${notification_warning}S/g")
+            event_block="${event_block//TRIGGER:-P300S/TRIGGER:-P${notification_warning}S}"
 
-            if ! echo "$event_block" | grep -q "^UID:"; then
+            if [[ "$event_block" != *$'\nUID:'* ]]; then
                 local uid=$(generate_event_uid "$event_block" "calcurse")
-                event_block=$(echo "$event_block" | sed "/^BEGIN:VEVENT/a UID:$uid")
+                event_block="${event_block/BEGIN:VEVENT/BEGIN:VEVENT$'\n'UID:$uid}"
             fi
-            echo "$event_block"
+            printf '%s\n' "$event_block"
             in_event=0
             event_block=""
         elif [[ $in_event -eq 1 ]]; then
@@ -1002,12 +1026,6 @@ normalize_rrule_for_comparison() {
     # Se vuoto, ritorna vuoto
     [[ -z "$rrule" ]] && return
 
-    # Rimuovi BYMONTH (problema noto)
-    rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
-
-    # Normalizza UNTIL a solo data (ignora orario e Z)
-    rrule=$(echo "$rrule" | sed -E 's/UNTIL=[0-9]{8}T[0-9]{6}Z?/UNTIL=NORM/g')
-
     # Estrai i componenti e ordina alfabeticamente
     local freq="" byday="" bymonthday="" bymonth="" until="" interval="" count="" wkst=""
 
@@ -1017,8 +1035,14 @@ normalize_rrule_for_comparison() {
             FREQ=*) freq="$component" ;;
             BYDAY=*) byday="$component" ;;
             BYMONTHDAY=*) bymonthday="$component" ;;
-            BYMONTH=*) bymonth="$component" ;;
-            UNTIL=*) until="$component" ;;
+            BYMONTH=*) : ;; # Ignorato per compatibilita tra Calcurse e Proton
+            UNTIL=*)
+                if [[ "$component" =~ ^UNTIL=[0-9]{8}T[0-9]{6}Z?$ ]]; then
+                    until="UNTIL=NORM"
+                else
+                    until="$component"
+                fi
+                ;;
             INTERVAL=*) interval="$component" ;;
             COUNT=*) count="$component" ;;
             WKST=*) wkst="$component" ;;
@@ -1047,63 +1071,37 @@ normalize_rrule_for_comparison() {
 # ----------------------------------------------------------------------
 compute_event_hash() {
     local event_block="$1"
+    local dtstart="" dtend="" summary="" description="" duration=""
+    local in_alarm=0 line
 
-    # Normalizza: rimuovi campi che variano tra sistemi
-    local normalized_block
-    normalized_block=$(echo "$event_block" | grep -v "^STATUS:" | grep -v "^SEQUENCE:" | grep -v "^DTSTAMP:")
-
-    # Helper locale: normalizza token data/ora (YYYYMMDD o YYYYMMDDTHHMMSS)
-    _norm_dt_token_for_hash() {
-        local v="$1"
-        v=$(echo "$v" | tr -d '
-' | sed 's/Z$//')
-        # Togli caratteri strani, lascia solo цифre e T
-        v=$(echo "$v" | tr -cd '0-9T')
-        if [[ "$v" =~ ^[0-9]{8}T[0-9]{4}$ ]]; then
-            v="${v}00"
-        fi
-        echo "$v"
-    }
-
-    local dtstart_line dtstart dtend_line dtend
-    dtstart_line=$(echo "$normalized_block" | grep -m1 "^DTSTART")
-    dtstart=$(_norm_dt_token_for_hash "$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' )")
-
-    dtend_line=$(echo "$normalized_block" | grep -m1 "^DTEND")
-    dtend=$(_norm_dt_token_for_hash "$(echo "$dtend_line" | sed 's/^DTEND[^:]*://' )")
-
-    local summary
-    summary=$(echo "$normalized_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '
-')
-
-    # DESCRIPTION: Prendi solo quella FUORI da VALARM
-    local description=""
-    local in_alarm=0
     while IFS= read -r line; do
-        if [[ "$line" == "BEGIN:VALARM" ]]; then
-            in_alarm=1
-        elif [[ "$line" == "END:VALARM" ]]; then
-            in_alarm=0
-        elif [[ $in_alarm -eq 0 && "$line" =~ ^DESCRIPTION: ]]; then
-            description=$(echo "$line" | cut -d: -f2- | tr -d '
-')
-            break
-        fi
-    done <<< "$normalized_block"
+        line="${line%$'\r'}"
+        case "$line" in
+            BEGIN:VALARM) in_alarm=1; continue ;;
+            END:VALARM) in_alarm=0; continue ;;
+        esac
 
-    # DURATION: calcola correttamente o da DTEND
+        [[ $in_alarm -eq 1 ]] && continue
+        case "$line" in
+            DTSTART*) [[ -z "$dtstart" ]] && dtstart="${line#*:}" ;;
+            DTEND*) [[ -z "$dtend" ]] && dtend="${line#*:}" ;;
+            SUMMARY:*) [[ -z "$summary" ]] && summary="${line#SUMMARY:}" ;;
+            DESCRIPTION:*) [[ -z "$description" ]] && description="${line#DESCRIPTION:}" ;;
+            DURATION:*) [[ -z "$duration" ]] && duration="${line#DURATION:}" ;;
+        esac
+    done <<< "$event_block"
+
+    dtstart=$(_norm_dt_token_for_hash "$dtstart")
+    dtend=$(_norm_dt_token_for_hash "$dtend")
+
     local duration_min=0
-    if echo "$normalized_block" | grep -q "^DURATION:"; then
-        local duration
-        duration=$(echo "$normalized_block" | grep -m1 "^DURATION:" | cut -d: -f2- | tr -d '
-')
+    if [[ -n "$duration" ]]; then
         local days=0 hours=0 minutes=0
         [[ $duration =~ P([0-9]+)D ]] && days=${BASH_REMATCH[1]}
         [[ $duration =~ ([0-9]+)H ]] && hours=${BASH_REMATCH[1]}
         [[ $duration =~ ([0-9]+)M ]] && minutes=${BASH_REMATCH[1]}
         duration_min=$((days * 1440 + hours * 60 + minutes))
     elif [[ -n "$dtend" ]]; then
-        # Caso "all-day": DTSTART/DTEND sono date-only (YYYYMMDD)
         if [[ "$dtstart" =~ ^[0-9]{8}$ && "$dtend" =~ ^[0-9]{8}$ ]]; then
             local s="${dtstart:0:4}-${dtstart:4:2}-${dtstart:6:2}"
             local e="${dtend:0:4}-${dtend:4:2}-${dtend:6:2}"
@@ -1117,7 +1115,6 @@ compute_event_hash() {
             else
                 duration_min=1440
             fi
-        # Caso "timed": YYYYMMDDTHHMMSS
         elif [[ "$dtstart" =~ ^[0-9]{8}T[0-9]{6}$ && "$dtend" =~ ^[0-9]{8}T[0-9]{6}$ ]]; then
             local start_hour=${dtstart:9:2}
             local start_min=${dtstart:11:2}
@@ -1128,22 +1125,30 @@ compute_event_hash() {
             duration_min=$((end_total - start_total))
             [[ $duration_min -lt 0 ]] && duration_min=$((duration_min + 1440))
         else
-            # Fallback se formato non riconosciuto
             duration_min=30
         fi
+    elif [[ "$dtstart" =~ ^[0-9]{8}$ ]]; then
+        duration_min=1440
     else
-        # Nessun DTEND/DURATION: se è all-day, considera 1 giorno, altrimenti 30 min
-        if [[ "$dtstart" =~ ^[0-9]{8}$ ]]; then
-            duration_min=1440
-        else
-            duration_min=30
-        fi
+        duration_min=30
     fi
 
-    # NON includere alarm_sig o EXDATE nell'hash (variano tra sistemi)
-    echo -n "${dtstart}|${summary}|${description}|${duration_min}" | sha256sum | cut -d' ' -f1 | head -c16
+    local hash
+    hash=$(printf '%s' "${dtstart}|${summary}|${description}|${duration_min}" | sha256sum)
+    hash="${hash%% *}"
+    echo "${hash:0:16}"
 }
 
+_norm_dt_token_for_hash() {
+    local v="$1"
+    v="${v%Z}"
+    v="${v//[[:space:]]/}"
+    v="${v//[!0-9T]/}"
+    if [[ "$v" =~ ^[0-9]{8}T[0-9]{4}$ ]]; then
+        v="${v}00"
+    fi
+    echo "$v"
+}
 
 # ----------------------------------------------------------------------
 # HELPERS: normalizzazione EXDATE/DTSTART per confronto e import Calcurse
@@ -1151,8 +1156,9 @@ compute_event_hash() {
 
 _norm_dt_token_common() {
     local v="$1"
-    v=$(echo "$v" | tr -d ' \r\n' | sed 's/Z$//')
-    v=$(echo "$v" | tr -cd '0-9T')
+    v="${v%Z}"
+    v="${v//[[:space:]]/}"
+    v="${v//[!0-9T]/}"
     if [[ "$v" =~ ^[0-9]{8}T[0-9]{4}$ ]]; then
         v="${v}00"
     fi
@@ -1161,36 +1167,45 @@ _norm_dt_token_common() {
 
 extract_exdates_normalized() {
     local event_block="$1"
-    local acc=""
+    local acc="" line
     while IFS= read -r line; do
-        [[ "$line" =~ ^EXDATE ]] || continue
+        line="${line%$'\r'}"
+        [[ "$line" == EXDATE* ]] || continue
         local payload="${line#*:}"
-        payload=$(echo "$payload" | tr -d '\r\n ')
+        payload="${payload//[[:space:]]/}"
         IFS=',' read -ra parts <<< "$payload"
+        local p t
         for p in "${parts[@]}"; do
-            local t=$(_norm_dt_token_common "$p")
+            t=$(_norm_dt_token_common "$p")
             [[ -n "$t" ]] && acc+="${t}"$'\n'
         done
-    done < <(echo "$event_block" | grep "^EXDATE")
+    done <<< "$event_block"
 
     if [[ -z "$acc" ]]; then
         echo ""
         return 0
     fi
 
-    echo "$acc" | sort -u | tr '\n' ',' | sed 's/,$//'
+    local -a sorted=()
+    mapfile -t sorted < <(printf '%s' "$acc" | sort -u)
+    local IFS=,
+    echo "${sorted[*]}"
 }
 
 generate_recurrence_signature() {
     local event_block="$1"
-    local dtstart_line dtstart summary rrule
-    dtstart_line=$(echo "$event_block" | grep -m1 "^DTSTART")
-    dtstart=$(_norm_dt_token_common "$(echo "$dtstart_line" | sed 's/^DTSTART[^:]*://' )")
+    local dtstart="" summary="" rrule="" line
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        case "$line" in
+            DTSTART*) [[ -z "$dtstart" ]] && dtstart="${line#*:}" ;;
+            SUMMARY:*) [[ -z "$summary" ]] && summary="${line#SUMMARY:}" ;;
+            RRULE:*) [[ -z "$rrule" ]] && rrule="${line#RRULE:}" ;;
+        esac
+    done <<< "$event_block"
 
-    summary=$(echo "$event_block" | grep -m1 "^SUMMARY:" | cut -d: -f2- | tr -d '\r\n')
-    rrule=$(echo "$event_block" | grep -m1 "^RRULE:" | cut -d: -f2- | tr -d '\r\n')
+    dtstart=$(_norm_dt_token_common "$dtstart")
     [[ -n "$rrule" ]] && rrule=$(normalize_rrule_for_comparison "$rrule")
-
     echo "${dtstart}|${summary}|${rrule}"
 }
 
