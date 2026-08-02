@@ -12,13 +12,33 @@ IMPORT_FILE="$BACKUP_DIR/calendar.ics"
 EXPORT_FILE="$BACKUP_DIR/calendario.ics"
 BACKUP_FILE="$BACKUP_DIR/backup_$TODAY.ics"
 NEW_EVENTS_FILE="$BACKUP_DIR/nuovi-appuntamenti-calcurse.ics"
-
-mkdir -p "$BACKUP_DIR"
+DRY_RUN=0
 
 die() {
     echo "❌ Errore: $1" >&2
     exit 1
 }
+
+show_usage() {
+    echo "Usage: ${0##*/} [--dry-run]"
+    echo ""
+    echo "  --dry-run  Analyze guided sync choices without modifying files or Calcurse"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help) show_usage; exit 0 ;;
+        *) die "Unknown option: $1" ;;
+    esac
+    shift
+done
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    [[ -d "$BACKUP_DIR" ]] || die "Calendar directory not found: $BACKUP_DIR"
+else
+    mkdir -p "$BACKUP_DIR"
+fi
 
 # ----------------------------------------------------------------------
 # FUNZIONE PULIZIA BACKUP
@@ -41,7 +61,11 @@ find_and_prepare_proton_file() {
     proton_file=$(find "$BACKUP_DIR" -maxdepth 1 \( -name "My calendar-*.ics" -o -name "My Calendar-*.ics" \) -type f | sort -r | head -n1)
 
     if [[ -n "$proton_file" ]]; then
-        mv "$proton_file" "$IMPORT_FILE"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            IMPORT_FILE="$proton_file"
+        else
+            mv "$proton_file" "$IMPORT_FILE"
+        fi
     elif [[ -f "$IMPORT_FILE" ]]; then
         :
     else
@@ -957,7 +981,7 @@ generate_event_key() {
 }
 
 export_calcurse_with_uids() {
-   # echo "📤 Esporto i miei eventi con UID in $EXPORT_FILE…"
+    local destination="${1:-$EXPORT_FILE}"
     local temp_export=$(mktemp)
     calcurse -D "$CALCURSE_DIR" --export > "$temp_export" || die "Export failed"
 
@@ -1011,10 +1035,10 @@ export_calcurse_with_uids() {
         else
             echo "$line"
         fi
-    done < "$temp_export" > "$EXPORT_FILE"
+    done < "$temp_export" > "$destination"
 
     rm -f "$temp_export"
-    [[ -s "$EXPORT_FILE" ]] # && echo "✅ Esportazione con UID completata"
+    [[ -s "$destination" ]]
 }
 
 # ----------------------------------------------------------------------
@@ -1521,7 +1545,13 @@ filter_events_by_date() {
 option_A() {
     echo "🔄 INTERACTIVE BIDIRECTIONAL SYNC: Calcurse ↔ Proton"
 
-    export_calcurse_with_uids
+    local comparison_export="$EXPORT_FILE"
+    local dry_run_export=""
+    if [[ $DRY_RUN -eq 1 ]]; then
+        dry_run_export=$(mktemp) || die "Unable to create temporary dry-run export"
+        comparison_export="$dry_run_export"
+    fi
+    export_calcurse_with_uids "$comparison_export"
 
     # ============================================================
     # CONTROLLO FRESHNESS DEL FILE PROTON
@@ -1546,6 +1576,7 @@ option_A() {
 
         if [[ ! "$continue_old" =~ ^[yY]$ ]]; then
             echo "❌ Sync cancelled. Please download a fresh calendar from Proton."
+            rm -f "$dry_run_export"
             return 1
         fi
         echo ""
@@ -1570,6 +1601,7 @@ option_A() {
 
             if [[ ! "$continue_old" =~ ^[yY]$ ]]; then
                 echo "❌ Sync cancelled. Please download a fresh calendar from Proton."
+                rm -f "$dry_run_export"
                 return 1
             fi
             echo ""
@@ -1588,7 +1620,7 @@ option_A() {
     local calcurse_tmp=$(mktemp)
 
     awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$IMPORT_FILE" | tr -d '\r' > "$proton_tmp"
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$EXPORT_FILE" | tr -d '\r' > "$calcurse_tmp"
+    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$comparison_export" | tr -d '\r' > "$calcurse_tmp"
 
     local proton_file_count=$(grep -c "^BEGIN:VEVENT" "$proton_tmp" 2>/dev/null || echo "0")
     local calcurse_file_count=$(grep -c "^BEGIN:VEVENT" "$calcurse_tmp" 2>/dev/null || echo "0")
@@ -2097,7 +2129,10 @@ option_A() {
        [[ ${#events_to_export_to_proton[@]} -eq 0 ]] && \
        [[ ${#alarm_backfills_to_apply[@]} -eq 0 ]]; then
         echo "✅ No changes to apply. The calendars are synchronized!"
-        rm -f "$proton_tmp" "$calcurse_tmp"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "🧪 DRY RUN COMPLETE: no files or Calcurse data were modified."
+        fi
+        rm -f "$proton_tmp" "$calcurse_tmp" "$dry_run_export"
         return 0
     fi
 
@@ -2137,6 +2172,13 @@ option_A() {
     if [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]]; then
         echo "🔔 Missing notifications to add: ${#alarm_backfills_to_apply[@]}"
         echo ""
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "🧪 DRY RUN COMPLETE: the changes above were not applied."
+        echo "   No files or Calcurse data were modified."
+        rm -f "$proton_tmp" "$calcurse_tmp" "$dry_run_export"
+        return 0
     fi
 
     read -rp "Do you confirm applying these changes? (y/N): " confirm
@@ -2653,6 +2695,9 @@ option_F() {
 }
 
 echo "🔔 REMEMBER: Make sure you have downloaded the UPDATED file from Proton Calendar"
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "🧪 DRY RUN MODE: only guided sync analysis is available; nothing will be modified"
+fi
 echo "Choose an option:"
 echo "A) 🔄 GUIDED BIDIRECTIONAL SYNC: Calcurse ↔ Proton + report"
 echo "B) 🧹 COMPLETE SYNC: Proton → Calcurse (REPLACES everything)"
@@ -2665,7 +2710,14 @@ while true; do
 
     case "${choice^^}" in
         A) option_A; break ;;
-        B|F) option_F; break ;;  # 'F' kept as a legacy alias
+        B|F)
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "❌ Complete sync is unavailable in dry-run mode. Choose A or Q."
+                continue
+            fi
+            option_F
+            break
+            ;;  # 'F' kept as a legacy alias
         Q) echo "👋 Goodbye!"; exit 0 ;;
         *) echo "❌ Error: Invalid choice. Use A, B or Q." ;;
     esac

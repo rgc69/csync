@@ -36,6 +36,19 @@ sudo ln -s ~/Projects/calendar/calcurse-sync.sh /usr/local/bin/csync
 4. Confirm the changes
 5. Import the generated file into Proton **only if** the script produced an export file
 
+### Preview Without Changes
+
+Run the guided analysis without modifying Calcurse or any calendar file:
+
+```bash
+./calcurse-sync.sh --dry-run
+```
+
+Choose Option A and answer the usual guided questions. The script displays the
+complete change summary, but does not rename the Proton download, create a
+backup, update Calcurse, or generate a Proton export. Complete sync (Option B)
+is disabled in this mode.
+
 ## 🧭 Menu Options
 
 When you run `csync`, you’ll see:

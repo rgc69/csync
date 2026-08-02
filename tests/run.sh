@@ -58,12 +58,13 @@ install_proton_fixture() {
 
 run_sync() {
     local answers="$1"
+    shift
     printf '%s' "$answers" | \
         env HOME="$test_home" \
             XDG_DATA_HOME="$test_home/.local/share" \
             XDG_CONFIG_HOME="$test_home/.config" \
             LC_ALL=C \
-            bash "$SCRIPT" > "$output_file" 2>&1
+            bash "$SCRIPT" "$@" > "$output_file" 2>&1
     sync_status=${PIPESTATUS[1]}
 }
 
@@ -215,6 +216,53 @@ test_alarm_backfill_filters() {
     event_lacks_line "$backup_dir/calendario.ics" "All Day Alarm" "BEGIN:VALARM" || return 1
 }
 
+test_dry_run_preserves_everything() {
+    begin_case dry_run
+    seed_calcurse calcurse-new.ics || return 1
+    install_proton_fixture proton-new.ics
+
+    local proton_file="$backup_dir/My Calendar-test.ics"
+    local apts_before todo_before proton_before
+    apts_before=$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)
+    todo_before=$(sha256sum "$calcurse_dir/todo" | cut -d' ' -f1)
+    proton_before=$(sha256sum "$proton_file" | cut -d' ' -f1)
+
+    run_sync $'A\ny\nB\n' --dry-run
+    assert_status 0 || return 1
+    assert_contains "$output_file" "DRY RUN COMPLETE: the changes above were not applied." || return 1
+    assert_contains "$output_file" "Events to import into Calcurse: 1" || return 1
+    assert_contains "$output_file" "Events to export to Proton: 1" || return 1
+
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || {
+        printf 'Dry-run changed appointments\n' >&2
+        return 1
+    }
+    [[ "$todo_before" == "$(sha256sum "$calcurse_dir/todo" | cut -d' ' -f1)" ]] || {
+        printf 'Dry-run changed TODO items\n' >&2
+        return 1
+    }
+    [[ -f "$proton_file" ]] || {
+        printf 'Dry-run moved or deleted the Proton download\n' >&2
+        return 1
+    }
+    [[ "$proton_before" == "$(sha256sum "$proton_file" | cut -d' ' -f1)" ]] || {
+        printf 'Dry-run changed the Proton download\n' >&2
+        return 1
+    }
+
+    [[ ! -e "$backup_dir/calendar.ics" ]] || return 1
+    [[ ! -e "$backup_dir/calendario.ics" ]] || return 1
+    [[ ! -e "$backup_dir/nuovi-appuntamenti-calcurse.ics" ]] || return 1
+    local backups=("$backup_dir"/backup_*.ics)
+    [[ ! -e "${backups[0]}" ]] || return 1
+
+    run_sync $'B\nQ\n' --dry-run
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Complete sync is unavailable in dry-run mode." || return 1
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
+    [[ -f "$proton_file" ]] || return 1
+}
+
 test_atomic_failure_preserves_data() {
     begin_case atomic_failure
     seed_calcurse atomic-seed.ics || return 1
@@ -277,6 +325,7 @@ run_test "Proton import and second-pass idempotence" test_proton_import_and_idem
 run_test "Calcurse-only event export" test_calcurse_export
 run_test "Recurring EXDATE update with alarm" test_recurring_exdate_and_alarm
 run_test "Alarm backfill compatibility filters" test_alarm_backfill_filters
+run_test "Dry-run preserves files and Calcurse data" test_dry_run_preserves_everything
 run_test "Atomic failure preserves appointments/TODO" test_atomic_failure_preserves_data
 
 printf '\nResult: %s passed, %s failed (%ss)\n' \
