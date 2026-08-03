@@ -46,8 +46,8 @@ Run the guided analysis without modifying Calcurse or any calendar file:
 
 Choose Option A and answer the usual guided questions. The script displays the
 complete change summary, but does not rename the Proton download, create a
-backup, update Calcurse, or generate a Proton export. Complete sync (Option B)
-is disabled in this mode.
+backup, update Calcurse, write synchronization state, or generate a Proton
+export. Complete sync (Option B) is disabled in this mode.
 
 ## 🧭 Menu Options
 
@@ -111,8 +111,9 @@ directory for every scenario. It never reads or modifies the user's Calcurse
 database. Set `KEEP_TEST_TMP=1` to retain the temporary files after a run.
 
 Covered flows include guided import and export, second-pass idempotence,
-recurring-event `EXDATE` updates, compatible alarm backfill, unsupported alarm
-filters, and atomic failure preservation for appointments and TODO items.
+recurring-event `EXDATE` updates, compatible alarm backfill and removal,
+persistent-state decisions, dry-run preservation, unsupported alarm filters,
+and atomic failure preservation for appointments and TODO items.
 
 ### Event Normalization
 
@@ -152,8 +153,19 @@ Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
   interval (5, 10, 15, 30, 60, 120, or 1440 minutes).
 - During **Option A**, matching timed appointments that have a compatible
   Proton display alarm but no Calcurse notification can be backfilled in one
-  batch or reviewed individually. This backfill only adds missing
-  notifications; it does not remove or compare existing notification settings.
+  batch or reviewed individually.
+- The first successful Option A run creates an alarm baseline without inferring
+  removals. On later runs, when a compatible Proton display alarm has
+  disappeared but the matching Calcurse notification remains, the script asks
+  whether to remove it (`R`), keep it and accept the difference (`K`), or
+  postpone the decision until the next synchronization (`S`).
+- Alarm removal is never automatic. The state is updated only after a successful
+  normal Option A run; cancellation, failure, and `--dry-run` leave it
+  unchanged.
+- The state file is stored at
+  `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/alarm-state.tsv`.
+  It contains only hashed event identifiers and alarm-presence flags, not event
+  titles, descriptions, or dates.
 
 ## 📊 Example (Option A)
 
@@ -201,6 +213,8 @@ Choice: P
 - **Calcurse**: `~/.local/share/calcurse/` or `~/.calcurse/`
 - **Backup**: `~/Projects/calendar/` (configurable)
 - **Export**: `~/Projects/calendar/calcurse-export-to-proton.ics`
+- **Alarm state**:
+  `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/alarm-state.tsv`
 
 ***
 

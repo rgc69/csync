@@ -99,6 +99,33 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local file="$1"
+    local text="$2"
+    if grep -Fq -- "$text" "$file"; then
+        printf 'Expected %s not to contain: %s\n' "$file" "$text" >&2
+        return 1
+    fi
+}
+
+assert_state_value() {
+    local expected="$1"
+    local state_file="$test_home/.local/state/calcurse-sync/alarm-state.tsv"
+
+    [[ -f "$state_file" ]] || {
+        printf 'Alarm state file was not created: %s\n' "$state_file" >&2
+        return 1
+    }
+    if ! awk -F '\t' -v expected="$expected" '
+        NR == 1 { valid_header = ($1 == "calcurse-sync-alarm-state" && $2 == "1"); next }
+        NF == 2 && $2 == expected { matches++ }
+        END { exit(valid_header && matches == 1 ? 0 : 1) }
+    ' "$state_file"; then
+        printf 'Expected one alarm state entry with value %s\n' "$expected" >&2
+        return 1
+    fi
+}
+
 assert_line_count() {
     local expected="$1"
     local line="$2"
@@ -228,6 +255,92 @@ test_alarm_backfill_filters() {
     event_lacks_line "$backup_dir/calendario.ics" "All Day Alarm" "BEGIN:VALARM" || return 1
 }
 
+test_alarm_removal_state() {
+    begin_case alarm_removal
+    seed_calcurse proton-new.ics || return 1
+    install_proton_fixture proton-new.ics
+
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_state_value 1 || return 1
+
+    local state_file="$test_home/.local/state/calcurse-sync/alarm-state.tsv"
+    [[ "$(stat -c %a "$state_file")" == "600" ]] || return 1
+    [[ "$(stat -c %a "$(dirname "$state_file")")" == "700" ]] || return 1
+
+    install_proton_fixture proton-new-no-alarm.ics
+    local apts_before state_before proton_file="$backup_dir/My Calendar-test.ics"
+    apts_before=$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)
+    state_before=$(sha256sum "$state_file" | cut -d' ' -f1)
+
+    run_sync $'A\nR\n' --dry-run
+    assert_status 0 || return 1
+    assert_contains "$output_file" "whose Proton notification was removed" || return 1
+    assert_contains "$output_file" "Notifications to remove from Calcurse: 1" || return 1
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
+    [[ "$state_before" == "$(sha256sum "$state_file" | cut -d' ' -f1)" ]] || return 1
+    [[ -f "$proton_file" ]] || return 1
+
+    run_sync $'A\nR\ny\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Notifications removed: 1" || return 1
+    assert_state_value 0 || return 1
+    event_lacks_line "$backup_dir/calendario.ics" "Proton New Event" "BEGIN:VALARM" || return 1
+}
+
+test_alarm_removal_postpone_and_keep() {
+    begin_case alarm_removal_decisions
+    seed_calcurse proton-new.ics || return 1
+    install_proton_fixture proton-new.ics
+
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_state_value 1 || return 1
+
+    local apts_before
+    apts_before=$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)
+
+    install_proton_fixture proton-new-no-alarm.ics
+    run_sync $'A\nS\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Decision postponed" || return 1
+    assert_state_value 1 || return 1
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
+
+    install_proton_fixture proton-new-no-alarm.ics
+    run_sync $'A\nK\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "notification will be kept" || return 1
+    assert_state_value 0 || return 1
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
+
+    install_proton_fixture proton-new-no-alarm.ics
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_not_contains "$output_file" "whose Proton notification was removed" || return 1
+}
+
+test_invalid_alarm_state_is_safe() {
+    begin_case invalid_alarm_state
+    seed_calcurse proton-new.ics || return 1
+    install_proton_fixture proton-new-no-alarm.ics
+
+    local state_dir="$test_home/.local/state/calcurse-sync"
+    local state_file="$state_dir/alarm-state.tsv"
+    mkdir -p "$state_dir"
+    printf 'invalid state\n' > "$state_file"
+
+    local apts_before
+    apts_before=$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)
+
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Alarm state is invalid and will be rebuilt" || return 1
+    assert_not_contains "$output_file" "whose Proton notification was removed" || return 1
+    assert_state_value 0 || return 1
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
+}
+
 test_dry_run_preserves_everything() {
     begin_case dry_run
     seed_calcurse calcurse-new.ics || return 1
@@ -265,6 +378,10 @@ test_dry_run_preserves_everything() {
     [[ ! -e "$backup_dir/calendar.ics" ]] || return 1
     [[ ! -e "$backup_dir/calendario.ics" ]] || return 1
     [[ ! -e "$backup_dir/nuovi-appuntamenti-calcurse.ics" ]] || return 1
+    [[ ! -e "$test_home/.local/state/calcurse-sync/alarm-state.tsv" ]] || {
+        printf 'Dry-run created alarm synchronization state\n' >&2
+        return 1
+    }
     local backups=("$backup_dir"/backup_*.ics)
     [[ ! -e "${backups[0]}" ]] || return 1
 
@@ -338,6 +455,9 @@ run_test "Calcurse-only event export" test_calcurse_export
 run_test "Proton monthly BYDAY normalization" test_proton_monthly_byday_normalization
 run_test "Recurring EXDATE update with alarm" test_recurring_exdate_and_alarm
 run_test "Alarm backfill compatibility filters" test_alarm_backfill_filters
+run_test "Alarm removal baseline and dry-run" test_alarm_removal_state
+run_test "Alarm removal postpone and keep choices" test_alarm_removal_postpone_and_keep
+run_test "Invalid alarm state is rebuilt safely" test_invalid_alarm_state_is_safe
 run_test "Dry-run preserves files and Calcurse data" test_dry_run_preserves_everything
 run_test "Atomic failure preserves appointments/TODO" test_atomic_failure_preserves_data
 

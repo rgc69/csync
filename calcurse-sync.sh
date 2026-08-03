@@ -12,6 +12,9 @@ IMPORT_FILE="$BACKUP_DIR/calendar.ics"
 EXPORT_FILE="$BACKUP_DIR/calendario.ics"
 BACKUP_FILE="$BACKUP_DIR/backup_$TODAY.ics"
 NEW_EVENTS_FILE="$BACKUP_DIR/nuovi-appuntamenti-calcurse.ics"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync"
+ALARM_STATE_FILE="$STATE_DIR/alarm-state.tsv"
+ALARM_STATE_VERSION=1
 DRY_RUN=0
 
 die() {
@@ -364,6 +367,108 @@ add_display_alarm_to_event() {
     done < <(echo "$event_block")
 
     echo "${out%$'\n'}"
+}
+
+remove_alarms_from_event() {
+    local event_block="$1"
+    local out="" in_alarm=0 line
+
+    while IFS= read -r line; do
+        case "$line" in
+            BEGIN:VALARM*) in_alarm=1; continue ;;
+            END:VALARM*) in_alarm=0; continue ;;
+        esac
+        [[ $in_alarm -eq 0 ]] && out+="$line"$'\n'
+    done <<< "$event_block"
+
+    printf '%s' "${out%$'\n'}"
+}
+
+alarm_state_key() {
+    local event_block="$1"
+    local uid="" has_rrule=0 line identity hash
+
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        case "$line" in
+            UID:*) [[ -z "$uid" ]] && uid="${line#UID:}" ;;
+            RRULE:*) has_rrule=1 ;;
+        esac
+    done <<< "$event_block"
+
+    if [[ -n "$uid" ]]; then
+        identity="UID:${uid}"
+    elif [[ $has_rrule -eq 1 ]]; then
+        identity="RECURRENCE:$(generate_recurrence_signature "$event_block")"
+    else
+        identity="HASH:$(compute_event_hash "$event_block")"
+    fi
+
+    hash=$(printf '%s' "$identity" | sha256sum)
+    hash="${hash%% *}"
+    echo "${hash:0:32}"
+}
+
+load_alarm_state() {
+    local destination_name="$1"
+    local -n destination="$destination_name"
+
+    [[ -f "$ALARM_STATE_FILE" ]] || return 1
+
+    local expected_header=$'calcurse-sync-alarm-state\t1'
+    local header="" key alarm extra
+    IFS= read -r header < "$ALARM_STATE_FILE" || return 2
+    [[ "$header" == "$expected_header" ]] || return 2
+
+    while IFS=$'\t' read -r key alarm extra; do
+        [[ -z "$key" ]] && continue
+        if [[ ! "$key" =~ ^[0-9a-f]{32}$ || ! "$alarm" =~ ^[01]$ || -n "$extra" ]]; then
+            destination=()
+            return 2
+        fi
+        destination["$key"]="$alarm"
+    done < <(tail -n +2 "$ALARM_STATE_FILE")
+}
+
+save_alarm_state() {
+    local blocks_name="$1"
+    local overrides_name="$2"
+    local -n blocks="$blocks_name"
+    local -n overrides="$overrides_name"
+
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+    local tmp
+    tmp=$(mktemp "$STATE_DIR/.alarm-state.XXXXXX") || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
+
+    printf 'calcurse-sync-alarm-state\t%s\n' "$ALARM_STATE_VERSION" > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+
+    local pkey state_key alarm_value trigger
+    for pkey in "${!blocks[@]}"; do
+        state_key=$(alarm_state_key "${blocks[$pkey]}")
+        alarm_value=0
+        if event_is_timed "${blocks[$pkey]}"; then
+            trigger=$(extract_compatible_display_alarm_trigger "${blocks[$pkey]}")
+            [[ -n "$trigger" ]] && alarm_value=1
+        fi
+        if [[ -n "${overrides[$state_key]+present}" ]]; then
+            alarm_value="${overrides[$state_key]}"
+        fi
+        printf '%s\t%s\n' "$state_key" "$alarm_value" >> "$tmp" || {
+            rm -f "$tmp"
+            return 1
+        }
+    done
+
+    if ! mv -f "$tmp" "$ALARM_STATE_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 sanitize_vevent_for_calcurse() {
@@ -1794,6 +1899,46 @@ option_A() {
         fi
     done
 
+    # Reuse one canonical match for EXDATE and alarm decisions.
+    declare -A proton_to_calcurse
+    for pkey in "${!proton_events[@]}"; do
+        local pblock="${proton_blocks[$pkey]}"
+        local ckey="" puid=""
+
+        if [[ -n "${calcurse_events[$pkey]}" ]]; then
+            ckey="$pkey"
+        else
+            puid=$(echo "$pblock" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
+            if [[ -n "$puid" && -n "${calcurse_uids_to_keys[$puid]}" ]]; then
+                ckey="${calcurse_uids_to_keys[$puid]}"
+            fi
+        fi
+
+        if [[ -z "$ckey" ]] && echo "$pblock" | grep -q "^RRULE:"; then
+            local psig
+            psig=$(generate_recurrence_signature "$pblock")
+            [[ -n "${calcurse_sig_to_key[$psig]}" ]] && ckey="${calcurse_sig_to_key[$psig]}"
+        fi
+
+        if [[ -z "$ckey" ]]; then
+            local proton_hash="${proton_hash_by_key[$pkey]}"
+            [[ -n "${calcurse_hashes_map[$proton_hash]}" ]] && ckey="${calcurse_hashes_map[$proton_hash]}"
+        fi
+
+        [[ -n "$ckey" ]] && proton_to_calcurse["$pkey"]="$ckey"
+    done
+
+    declare -A previous_alarm_state
+    declare -A alarm_state_overrides
+    local alarm_state_loaded=0
+    load_alarm_state previous_alarm_state
+    local alarm_state_load_status=$?
+    if [[ $alarm_state_load_status -eq 0 ]]; then
+        alarm_state_loaded=1
+    elif [[ $alarm_state_load_status -eq 2 ]]; then
+        echo "⚠️  Alarm state is invalid and will be rebuilt without inferring removals."
+    fi
+
     for pkey in "${!proton_events[@]}"; do
         local pblock="${proton_blocks[$pkey]}"
         if ! echo "$pblock" | grep -q "^RRULE:"; then
@@ -1802,15 +1947,7 @@ option_A() {
 
         local puid
         puid=$(echo "$pblock" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
-
-        local ckey=""
-        if [[ -n "$puid" && -n "${calcurse_uids_to_keys[$puid]}" ]]; then
-            ckey="${calcurse_uids_to_keys[$puid]}"
-        else
-            local psig
-            psig=$(generate_recurrence_signature "$pblock")
-            [[ -n "${calcurse_sig_to_key[$psig]}" ]] && ckey="${calcurse_sig_to_key[$psig]}"
-        fi
+        local ckey="${proton_to_calcurse[$pkey]}"
         [[ -z "$ckey" ]] && continue
 
         local pex cex
@@ -2070,6 +2207,74 @@ option_A() {
         scheduled_proton_imports["$pkey"]=1
     done
 
+    declare -A alarm_removal_candidates
+    declare -A alarm_removals_to_apply
+
+    if [[ $alarm_state_loaded -eq 1 ]]; then
+        for pkey in "${!proton_events[@]}"; do
+            local pblock="${proton_blocks[$pkey]}"
+            event_is_timed "$pblock" || continue
+
+            local state_key
+            state_key=$(alarm_state_key "$pblock")
+            [[ "${previous_alarm_state[$state_key]}" == "1" ]] || continue
+
+            local proton_alarm_trigger
+            proton_alarm_trigger=$(extract_compatible_display_alarm_trigger "$pblock")
+            [[ -z "$proton_alarm_trigger" ]] || continue
+
+            local ckey="${proton_to_calcurse[$pkey]}"
+            [[ -n "$ckey" ]] || continue
+            [[ -z "${scheduled_calcurse_deletions[$ckey]}" ]] || continue
+            [[ -z "${scheduled_proton_imports[$pkey]}" ]] || continue
+
+            local calcurse_alarm_trigger
+            calcurse_alarm_trigger=$(extract_compatible_display_alarm_trigger "${calcurse_blocks[$ckey]}")
+            [[ -n "$calcurse_alarm_trigger" ]] || continue
+
+            alarm_removal_candidates["$ckey"]="${pkey}${us}${state_key}"
+        done
+    fi
+
+    if [[ ${#alarm_removal_candidates[@]} -gt 0 ]]; then
+        echo ""
+        echo "🔕 Found ${#alarm_removal_candidates[@]} appointment(s) whose Proton notification was removed"
+        echo "   These removals were detected from the previous successful sync."
+
+        for ckey in "${!alarm_removal_candidates[@]}"; do
+            local candidate="${alarm_removal_candidates[$ckey]}"
+            local candidate_pkey="${candidate%%${us}*}"
+            local candidate_state_key="${candidate#*${us}}"
+            local pval="${proton_events[$candidate_pkey]}"
+            local candidate_summary="${pval%%||*}"
+            local dtstart_line candidate_start
+            dtstart_line=$(echo "${proton_blocks[$candidate_pkey]}" | grep -m1 "^DTSTART")
+            candidate_start=$(_norm_dt_token_common "${dtstart_line#*:}")
+
+            echo ""
+            echo "   📝 ${candidate_summary:-[No title]}"
+            echo "   📅 $candidate_start"
+            echo "   R) Remove the notification from Calcurse"
+            echo "   K) Keep it in Calcurse and accept the difference"
+            echo "   S) Postpone and ask again next time"
+            read -rp "   Choice (R/K/S): " alarm_removal_choice
+
+            case "${alarm_removal_choice^^}" in
+                R)
+                    alarm_removals_to_apply["$ckey"]=1
+                    echo "   ✅ The Calcurse notification will be removed"
+                    ;;
+                K)
+                    echo "   ✅ The Calcurse notification will be kept"
+                    ;;
+                *)
+                    alarm_state_overrides["$candidate_state_key"]=1
+                    echo "   ⏭️  Decision postponed"
+                    ;;
+            esac
+        done
+    fi
+
     for pkey in "${!proton_events[@]}"; do
         local pblock="${proton_blocks[$pkey]}"
         event_is_timed "$pblock" || continue
@@ -2078,27 +2283,7 @@ option_A() {
         proton_alarm_trigger=$(extract_compatible_display_alarm_trigger "$pblock")
         [[ -n "$proton_alarm_trigger" ]] || continue
 
-        local ckey=""
-        if [[ -n "${calcurse_events[$pkey]}" ]]; then
-            ckey="$pkey"
-        else
-            local puid
-            puid=$(echo "$pblock" | grep -m1 "^UID:" | cut -d: -f2- | tr -d '\r\n ')
-            if [[ -n "$puid" && -n "${calcurse_uids_to_keys[$puid]}" ]]; then
-                ckey="${calcurse_uids_to_keys[$puid]}"
-            fi
-        fi
-
-        if [[ -z "$ckey" ]] && echo "$pblock" | grep -q "^RRULE:"; then
-            local psig
-            psig=$(generate_recurrence_signature "$pblock")
-            [[ -n "${calcurse_sig_to_key[$psig]}" ]] && ckey="${calcurse_sig_to_key[$psig]}"
-        fi
-
-        if [[ -z "$ckey" ]]; then
-            local proton_hash="${proton_hash_by_key[$pkey]}"
-            [[ -n "${calcurse_hashes_map[$proton_hash]}" ]] && ckey="${calcurse_hashes_map[$proton_hash]}"
-        fi
+        local ckey="${proton_to_calcurse[$pkey]}"
 
         [[ -n "$ckey" ]] || continue
         [[ -z "${scheduled_calcurse_deletions[$ckey]}" ]] || continue
@@ -2168,10 +2353,13 @@ option_A() {
     if [[ ${#events_to_import_to_calcurse[@]} -eq 0 ]] && \
        [[ ${#events_to_delete_from_calcurse[@]} -eq 0 ]] && \
        [[ ${#events_to_export_to_proton[@]} -eq 0 ]] && \
-       [[ ${#alarm_backfills_to_apply[@]} -eq 0 ]]; then
+       [[ ${#alarm_backfills_to_apply[@]} -eq 0 ]] && \
+       [[ ${#alarm_removals_to_apply[@]} -eq 0 ]]; then
         echo "✅ No changes to apply. The calendars are synchronized!"
         if [[ $DRY_RUN -eq 1 ]]; then
-            echo "🧪 DRY RUN COMPLETE: no files or Calcurse data were modified."
+            echo "🧪 DRY RUN COMPLETE: no files, state, or Calcurse data were modified."
+        elif ! save_alarm_state proton_blocks alarm_state_overrides; then
+            warn "Calendars are synchronized, but the alarm state could not be updated."
         fi
         rm -f "$proton_tmp" "$calcurse_tmp" "$dry_run_export"
         return 0
@@ -2215,6 +2403,11 @@ option_A() {
         echo ""
     fi
 
+    if [[ ${#alarm_removals_to_apply[@]} -gt 0 ]]; then
+        echo "🔕 Notifications to remove from Calcurse: ${#alarm_removals_to_apply[@]}"
+        echo ""
+    fi
+
     if [[ $DRY_RUN -eq 1 ]]; then
         echo "🧪 DRY RUN COMPLETE: the changes above were not applied."
         echo "   No files or Calcurse data were modified."
@@ -2239,7 +2432,8 @@ option_A() {
     # Apply every Calcurse-side decision as one validated database replacement.
     if [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]] || \
        [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]] || \
-       [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]]; then
+       [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]] || \
+       [[ ${#alarm_removals_to_apply[@]} -gt 0 ]]; then
         echo ""
         echo "🔄 Preparing atomic Calcurse update..."
 
@@ -2267,6 +2461,7 @@ option_A() {
         local deleted_count=0
         local imported_count=0
         local backfilled_count=0
+        local removed_notification_count=0
 
         while IFS= read -r line; do
             if [[ "$line" == "BEGIN:VEVENT" ]]; then
@@ -2283,6 +2478,10 @@ option_A() {
                     if [[ -n "${alarm_backfills_to_apply[$current_key]}" ]]; then
                         block=$(add_display_alarm_to_event "$block" "${alarm_backfills_to_apply[$current_key]}")
                         ((backfilled_count++))
+                    fi
+                    if [[ -n "${alarm_removals_to_apply[$current_key]}" ]]; then
+                        block=$(remove_alarms_from_event "$block")
+                        ((removed_notification_count++))
                     fi
                     printf '%s\n' "$block" >> "$target_calendar"
                     ((kept_count++))
@@ -2310,6 +2509,7 @@ option_A() {
         echo "  - Existing events deleted: $deleted_count"
         echo "  - Proton events imported: $imported_count"
         echo "  - Notifications added: $backfilled_count"
+        echo "  - Notifications removed: $removed_notification_count"
 
         if ! replace_calcurse_events_atomically "$target_calendar"; then
             rm -f "$target_calendar"
@@ -2356,10 +2556,15 @@ option_A() {
     # Aggiorna export
     if [[ ${#events_to_import_to_calcurse[@]} -gt 0 ]] || \
        [[ ${#events_to_delete_from_calcurse[@]} -gt 0 ]] || \
-       [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]]; then
+       [[ ${#alarm_backfills_to_apply[@]} -gt 0 ]] || \
+       [[ ${#alarm_removals_to_apply[@]} -gt 0 ]]; then
         echo ""
         echo "🔄 Updating Calcurse export..."
         export_calcurse_with_uids
+    fi
+
+    if ! save_alarm_state proton_blocks alarm_state_overrides; then
+        warn "Synchronization succeeded, but the alarm state could not be updated."
     fi
 
     # Pulizia
@@ -2375,6 +2580,7 @@ option_A() {
     echo "   • Events imported into Calcurse: ${#events_to_import_to_calcurse[@]}"
     echo "   • Events deleted from Calcurse: ${#events_to_delete_from_calcurse[@]}"
     echo "   • Notifications added to Calcurse: ${#alarm_backfills_to_apply[@]}"
+    echo "   • Notifications removed from Calcurse: ${#alarm_removals_to_apply[@]}"
     echo "   • Events to import into Proton: ${#events_to_export_to_proton[@]}"
     echo ""
     echo "💾 Backup available: $BACKUP_FILE"
