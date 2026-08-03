@@ -693,34 +693,84 @@ replace_calcurse_events_atomically() {
 
 clean_rrule_for_proton() {
     local rrule="$1"
+    local dtstart_line="${2:-}"
 
-
-    # Rimuovi elementi non supportati da Proton
+    # Remove elements that do not affect the supported daily/weekly forms.
     if [[ "$rrule" =~ FREQ=WEEKLY || "$rrule" =~ FREQ=DAILY ]]; then
-        # Per ricorrenze giornalieri e settimanali, rimuovi BYMONTH
         rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
     fi
 
-	# Se è una ricorrenza DAILY con BYDAY, trasformala in WEEKLY:
-	if [[ "$rrule" =~ FREQ=DAILY && "$rrule" =~ BYDAY= ]]; then
-		# Cambia solo il pezzo FREQ=DAILY -> FREQ=WEEKLY
-		rrule=${rrule/FREQ=DAILY/FREQ=WEEKLY}
+    # These forms describe the same occurrence set as a weekly rule when the
+    # interval is one and no additional monthly filter is present.
+    local byday="" interval="1" until_local="" has_month_filter=0 component
+    IFS=';' read -ra rrule_components <<< "$rrule"
+    for component in "${rrule_components[@]}"; do
+        case "$component" in
+            BYDAY=*) byday="${component#BYDAY=}" ;;
+            INTERVAL=*) interval="${component#INTERVAL=}" ;;
+            UNTIL=*)
+                local until_value="${component#UNTIL=}"
+                [[ "$until_value" =~ ^[0-9]{8}T[0-9]{6}$ ]] && until_local="$until_value"
+                ;;
+            BYMONTH=*|BYMONTHDAY=*|BYSETPOS=*) has_month_filter=1 ;;
+        esac
+    done
 
-		# Se vuoi anche limitare a 3 occorrenze (nel tuo caso specifico):
-		# rrule="$rrule;COUNT=3"
-	fi
+    if [[ "$rrule" == *"FREQ=DAILY"* && -n "$byday" && "$interval" == "1" ]]; then
+        rrule=${rrule/FREQ=DAILY/FREQ=WEEKLY}
+    elif [[ "$rrule" == *"FREQ=MONTHLY"* && "$interval" == "1" && \
+            $has_month_filter -eq 0 && \
+            "$byday" =~ ^(MO|TU|WE|TH|FR|SA|SU)(,(MO|TU|WE|TH|FR|SA|SU))*$ ]]; then
+        rrule=${rrule/FREQ=MONTHLY/FREQ=WEEKLY}
+    fi
 
-
-    # Rimuovi BYSETPOS (non supportato)
+    # Remove recurrence parts Proton does not accept. The conversion above is
+    # deliberately completed before this cleanup so semantics are not inferred
+    # from an already truncated rule.
     rrule=$(echo "$rrule" | sed 's/;BYSETPOS=[^;]*//g' | sed 's/BYSETPOS=[^;]*;//g')
-
-    # Rimuovi BYSECOND, BYMINUTE, BYHOUR (non supportati)
     rrule=$(echo "$rrule" | sed 's/;BY\(SECOND\|MINUTE\|HOUR\)=[^;]*//g')
-
-    # Rimuovi WKST (ignorato da Proton comunque)
     rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g' | sed 's/WKST=[^;]*;//g')
 
+    # A date-time UNTIL paired with a TZID DTSTART must be expressed in UTC.
+    local dtstart_params="${dtstart_line%%:*}"
+    local tzid=""
+    if [[ "$dtstart_params" == *"TZID="* ]]; then
+        tzid="${dtstart_params#*TZID=}"
+        tzid="${tzid%%;*}"
+    fi
+
+    if [[ -n "$until_local" && -n "$tzid" ]]; then
+        local until_iso until_epoch until_utc
+        until_iso="${until_local:0:4}-${until_local:4:2}-${until_local:6:2} ${until_local:9:2}:${until_local:11:2}:${until_local:13:2}"
+        until_epoch=$(TZ="$tzid" date -d "$until_iso" +%s 2>/dev/null || true)
+        if [[ -n "$until_epoch" ]]; then
+            until_utc=$(date -u -d "@$until_epoch" +%Y%m%dT%H%M%SZ 2>/dev/null || true)
+            [[ -n "$until_utc" ]] && rrule=${rrule/UNTIL=$until_local/UNTIL=$until_utc}
+        fi
+    fi
+
     echo "$rrule"
+}
+
+clean_event_rrules_for_proton() {
+    local event_block="$1"
+    local dtstart_line="" cleaned="" line
+
+    while IFS= read -r line; do
+        if [[ "$line" == DTSTART* && -z "$dtstart_line" ]]; then
+            dtstart_line="$line"
+        fi
+
+        if [[ "$line" == RRULE:* ]]; then
+            local cleaned_rrule
+            cleaned_rrule=$(clean_rrule_for_proton "${line#RRULE:}" "$dtstart_line")
+            cleaned+="RRULE:${cleaned_rrule}"$'\n'
+        else
+            cleaned+="${line}"$'\n'
+        fi
+    done <<< "$event_block"
+
+    printf '%s' "${cleaned%$'\n'}"
 }
 
 # ----------------------------------------------------------------------
@@ -1383,17 +1433,8 @@ EOF
 
             if [[ $is_duplicate -eq 0 ]]; then
                 local enriched_block=$(enrich_event_for_proton "$block")
-                local cleaned_block=""
-
-                while IFS= read -r line; do
-                    if [[ "$line" =~ ^RRULE: ]]; then
-                        local rrule="${line#RRULE:}"
-                        local cleaned_rrule=$(clean_rrule_for_proton "$rrule")
-                        cleaned_block+="RRULE:$cleaned_rrule"$'\n'
-                    else
-                        cleaned_block+="$line"$'\n'
-                    fi
-                done < <(echo "$enriched_block")
+                local cleaned_block
+                cleaned_block=$(clean_event_rrules_for_proton "$enriched_block")
 
                 local normalized_event=$(normalize_alarms "$cleaned_block" "proton")
                 normalized_event=$(echo "$normalized_event" | sed 's/BEGIN:VALARMTRIGGER/BEGIN:VALARM\nTRIGGER/g')
@@ -2295,17 +2336,9 @@ option_A() {
             # Aggiungi COLOR per BnB
             event_block=$(add_bnb_color "$event_block")
 
-            # Pulisci RRULE
-            local cleaned_block=""
-            while IFS= read -r line; do
-                if [[ "$line" =~ ^RRULE: ]]; then
-                    local rrule="${line#RRULE:}"
-                    local cleaned_rrule=$(clean_rrule_for_proton "$rrule")
-                    cleaned_block+="RRULE:${cleaned_rrule}"$'\n'
-                else
-                    cleaned_block+="${line}"$'\n'
-                fi
-            done < <(echo "$event_block")
+            # Pulisci RRULE usando anche il contesto DTSTART/TZID.
+            local cleaned_block
+            cleaned_block=$(clean_event_rrules_for_proton "$event_block")
 
             local normalized=$(normalize_alarms "$cleaned_block" "proton")
             normalized=$(echo "$normalized" | sed 's/BEGIN:VALARMTRIGGER/BEGIN:VALARM\nTRIGGER/g')

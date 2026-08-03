@@ -130,6 +130,15 @@ Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
 2. Summary and UID for matching and display
 3. `EXDATE` and compatible display-alarm presence handled separately
 
+### Proton Recurrence Compatibility
+
+- Calcurse can export `FREQ=MONTHLY` with an unnumbered `BYDAY` even when the
+  resulting occurrences are simply weekly. When no additional monthly filter
+  is present and the interval is one, the Proton export converts this safely to
+  `FREQ=WEEKLY`.
+- Date-time `UNTIL` values are converted from the event's `TZID` to UTC and
+  written with the required trailing `Z`.
+
 ### Alarm Conversion
 
 - **Proton → Calcurse**: keeps the first compatible `ACTION:DISPLAY` alarm

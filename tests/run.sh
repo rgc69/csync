@@ -186,6 +186,18 @@ test_calcurse_export() {
     assert_contains "$backup_dir/nuovi-appuntamenti-calcurse.ics" "UID:CALCURSE-" || return 1
 }
 
+test_proton_monthly_byday_normalization() {
+    begin_case proton_monthly_byday
+    seed_calcurse monthly-byday-calcurse.ics || return 1
+    install_proton_fixture empty.ics
+
+    run_sync $'A\nB\ny\n'
+    assert_status 0 || return 1
+    assert_line_count 1 "BEGIN:VEVENT" "$backup_dir/nuovi-appuntamenti-calcurse.ics" || return 1
+    assert_contains "$backup_dir/nuovi-appuntamenti-calcurse.ics" \
+        "RRULE:FREQ=WEEKLY;UNTIL=20261101T170000Z;BYDAY=MO" || return 1
+}
+
 test_recurring_exdate_and_alarm() {
     begin_case recurring_exdate
     seed_calcurse palestra-calcurse.ics || return 1
@@ -323,6 +335,7 @@ fi
 
 run_test "Proton import and second-pass idempotence" test_proton_import_and_idempotence
 run_test "Calcurse-only event export" test_calcurse_export
+run_test "Proton monthly BYDAY normalization" test_proton_monthly_byday_normalization
 run_test "Recurring EXDATE update with alarm" test_recurring_exdate_and_alarm
 run_test "Alarm backfill compatibility filters" test_alarm_backfill_filters
 run_test "Dry-run preserves files and Calcurse data" test_dry_run_preserves_everything
