@@ -807,17 +807,21 @@ clean_rrule_for_proton() {
 
     # These forms describe the same occurrence set as a weekly rule when the
     # interval is one and no additional monthly filter is present.
-    local byday="" interval="1" until_local="" has_month_filter=0 component
+    local byday="" bymonth="" bymonthday="" bysetpos="" interval="1"
+    local until_local="" has_month_filter=0 has_other_date_filter=0 component
     IFS=';' read -ra rrule_components <<< "$rrule"
     for component in "${rrule_components[@]}"; do
         case "$component" in
             BYDAY=*) byday="${component#BYDAY=}" ;;
+            BYMONTH=*) bymonth="${component#BYMONTH=}"; has_month_filter=1 ;;
+            BYMONTHDAY=*) bymonthday="${component#BYMONTHDAY=}"; has_month_filter=1 ;;
+            BYSETPOS=*) bysetpos="${component#BYSETPOS=}"; has_month_filter=1 ;;
+            BYYEARDAY=*|BYWEEKNO=*) has_other_date_filter=1 ;;
             INTERVAL=*) interval="${component#INTERVAL=}" ;;
             UNTIL=*)
                 local until_value="${component#UNTIL=}"
                 [[ "$until_value" =~ ^[0-9]{8}T[0-9]{6}$ ]] && until_local="$until_value"
                 ;;
-            BYMONTH=*|BYMONTHDAY=*|BYSETPOS=*) has_month_filter=1 ;;
         esac
     done
 
@@ -827,6 +831,28 @@ clean_rrule_for_proton() {
             $has_month_filter -eq 0 && \
             "$byday" =~ ^(MO|TU|WE|TH|FR|SA|SU)(,(MO|TU|WE|TH|FR|SA|SU))*$ ]]; then
         rrule=${rrule/FREQ=MONTHLY/FREQ=WEEKLY}
+    fi
+
+    # Calcurse can emit filters that merely restate DTSTART. Proton's native
+    # simple monthly/yearly rules omit them, so remove only exact redundancies.
+    local dtstart_value="${dtstart_line#*:}"
+    dtstart_value="${dtstart_value%Z}"
+    if [[ "$dtstart_value" =~ ^[0-9]{8}T ]]; then
+        local start_month=$((10#${dtstart_value:4:2}))
+        local start_monthday=$((10#${dtstart_value:6:2}))
+
+        if [[ "$rrule" == *"FREQ=MONTHLY"* && -z "$byday" && -z "$bymonth" ]] &&
+           [[ -z "$bysetpos" && $has_other_date_filter -eq 0 ]] &&
+           [[ "$bymonthday" =~ ^[0-9]+$ ]] &&
+           (( 10#$bymonthday == start_monthday )); then
+            rrule=$(echo "$rrule" | sed "s/;BYMONTHDAY=$bymonthday//g" | sed "s/BYMONTHDAY=$bymonthday;//g")
+        elif [[ "$rrule" == *"FREQ=YEARLY"* && -z "$byday" && -z "$bysetpos" ]] &&
+             [[ $has_other_date_filter -eq 0 && "$bymonth" =~ ^[0-9]+$ ]] &&
+             [[ "$bymonthday" =~ ^[0-9]+$ ]] &&
+             (( 10#$bymonth == start_month && 10#$bymonthday == start_monthday )); then
+            rrule=$(echo "$rrule" | sed "s/;BYMONTH=$bymonth//g" | sed "s/BYMONTH=$bymonth;//g")
+            rrule=$(echo "$rrule" | sed "s/;BYMONTHDAY=$bymonthday//g" | sed "s/BYMONTHDAY=$bymonthday;//g")
+        fi
     fi
 
     # Remove recurrence parts Proton does not accept. The conversion above is
@@ -943,6 +969,16 @@ enrich_event_for_proton() {
             else
                 dtstart=$(echo "$line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
                 result+="DTSTART;TZID=$user_tz:$dtstart"$'\n'
+            fi
+        elif [[ "$line" =~ ^EXDATE ]]; then
+            local exdate_value
+            exdate_value=$(echo "${line#*:}" | tr -d '\r\n ')
+            if [[ "$line" == *"VALUE=DATE"* ]]; then
+                result+="EXDATE;VALUE=DATE:$exdate_value"$'\n'
+            elif [[ "$line" == *"TZID="* || "$exdate_value" == *Z* ]]; then
+                result+="${line%$'\r'}"$'\n'
+            else
+                result+="EXDATE;TZID=$user_tz:$exdate_value"$'\n'
             fi
         elif [[ "$line" =~ ^RRULE: ]]; then
             rrule="${line#RRULE:}"

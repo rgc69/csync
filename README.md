@@ -111,9 +111,11 @@ directory for every scenario. It never reads or modifies the user's Calcurse
 database. Set `KEEP_TEST_TMP=1` to retain the temporary files after a run.
 
 Covered flows include guided import and export, second-pass idempotence,
-recurring-event `EXDATE` updates, compatible alarm backfill and removal,
-persistent-state decisions, dry-run preservation, unsupported alarm filters,
-and atomic failure preservation for appointments and TODO items.
+daily, weekly, monthly, and yearly `EXDATE` updates, Proton-compatible
+recurrence export, compatible alarm backfill and removal, persistent-state
+decisions, recurring alarm removal without `RRULE`/`EXDATE` loss, dry-run
+preservation, unsupported alarm filters, and atomic failure preservation for
+appointments and TODO items.
 
 ### Event Normalization
 
@@ -139,6 +141,17 @@ Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
   `FREQ=WEEKLY`.
 - Date-time `UNTIL` values are converted from the event's `TZID` to UTC and
   written with the required trailing `Z`.
+
+### Proton Recurrence Test Constraints
+
+The recurrence fixtures use Proton's documented
+[daily, weekly, monthly, and yearly frequencies](https://proton.me/support/protoncalendar-create-update-and-delete-recurring-events).
+Their dates stay between 2030 and 2033 and every series has fewer than 49
+occurrences, within Proton Calendar's current
+[import date range](https://proton.me/support/how-to-import-calendar-to-proton-calendar)
+and custom recurrence limits. Timed `EXDATE` values are exported with the same
+`TZID` as `DTSTART`, date-time `UNTIL` values are emitted in UTC, and simple
+monthly/yearly rules match the forms found in Proton's own exports.
 
 ### Alarm Conversion
 

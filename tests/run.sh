@@ -236,9 +236,46 @@ test_recurring_exdate_and_alarm() {
     assert_line_count 1 "BEGIN:VALARM" "$backup_dir/calendario.ics" || return 1
 
     local friday
-    for friday in 20990904 20990911 20990918 20990925; do
+    for friday in 20300906 20300913 20300920 20300927; do
         assert_contains "$backup_dir/calendario.ics" "$friday" || return 1
     done
+}
+
+test_proton_recurrence_export_compatibility() {
+    begin_case proton_recurrence_export
+    seed_calcurse recurrence-series-proton-exdates.ics || return 1
+    install_proton_fixture empty.ics
+
+    run_sync $'A\nB\nB\nB\nB\ny\n'
+    assert_status 0 || return 1
+
+    local export_file="$backup_dir/nuovi-appuntamenti-calcurse.ics"
+    assert_line_count 4 "BEGIN:VEVENT" "$export_file" || return 1
+    if command -v icalendar >/dev/null 2>&1; then
+        icalendar "$export_file" >/dev/null || {
+            printf 'The generated Proton export is not parseable as iCalendar\n' >&2
+            return 1
+        }
+    fi
+
+    event_has_line "$export_file" "Daily Exclusions" "RRULE:FREQ=DAILY;UNTIL=20300110T080000Z" || return 1
+    event_has_line "$export_file" "Weekly Exclusions" "RRULE:FREQ=WEEKLY;UNTIL=20300204T090000Z;BYDAY=MO,WE" || return 1
+    event_has_line "$export_file" "Monthly Exclusions" "RRULE:FREQ=MONTHLY;UNTIL=20300615T160000Z" || return 1
+    event_has_line "$export_file" "Yearly Exclusions" "RRULE:FREQ=YEARLY;UNTIL=20330220T110000Z" || return 1
+
+    event_has_line "$export_file" "Daily Exclusions" "EXDATE;TZID=Europe/Rome:20300103T090000,20300107T090000,20300109T090000" || return 1
+    event_has_line "$export_file" "Weekly Exclusions" "EXDATE;TZID=Europe/Rome:20300109T100000,20300114T100000,20300130T100000" || return 1
+    event_has_line "$export_file" "Monthly Exclusions" "EXDATE;TZID=Europe/Rome:20300215T180000,20300515T180000" || return 1
+    event_has_line "$export_file" "Yearly Exclusions" "EXDATE;TZID=Europe/Rome:20310220T120000,20330220T120000" || return 1
+
+    if grep -Eq '^RRULE:.*(BYSETPOS|BYSECOND|BYMINUTE|BYHOUR|WKST)=' "$export_file"; then
+        printf 'Proton export contains an unsupported recurrence component\n' >&2
+        return 1
+    fi
+    if grep -Eq '(^|[^0-9])(19[0-6][0-9]|20(3[8-9]|[4-9][0-9]))[0-9]{4}' "$export_file"; then
+        printf 'Proton export contains a date outside the 1970-2037 range\n' >&2
+        return 1
+    fi
 }
 
 test_alarm_backfill_filters() {
@@ -317,6 +354,89 @@ test_alarm_removal_postpone_and_keep() {
     install_proton_fixture proton-new-no-alarm.ics
     run_sync $'A\n'
     assert_status 0 || return 1
+    assert_not_contains "$output_file" "whose Proton notification was removed" || return 1
+}
+
+test_recurring_exdate_frequency_matrix() {
+    begin_case recurring_exdate_frequency_matrix
+    seed_calcurse recurrence-series-base.ics || return 1
+    install_proton_fixture recurrence-series-base.ics
+
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "No changes to apply. The calendars are synchronized!" || return 1
+
+    install_proton_fixture recurrence-series-proton-exdates.ics
+    local apts_before proton_file="$backup_dir/My Calendar-test.ics"
+    apts_before=$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)
+
+    run_sync $'A\nP\nP\nP\nP\n' --dry-run
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Found 4 recurring event(s) with different exclusions" || return 1
+    assert_contains "$output_file" "Events to import into Calcurse: 4" || return 1
+    assert_contains "$output_file" "Events to delete from Calcurse: 4" || return 1
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
+    [[ -f "$proton_file" ]] || return 1
+
+    run_sync $'A\nP\nP\nP\nP\ny\n'
+    assert_status 0 || return 1
+    assert_line_count 4 "BEGIN:VEVENT" "$backup_dir/calendario.ics" || return 1
+    assert_contains "$output_file" "Proton events imported: 4" || return 1
+
+    event_has_line "$backup_dir/calendario.ics" "Daily Exclusions" "RRULE:FREQ=DAILY;UNTIL=20300110T090000" || return 1
+    event_has_line "$backup_dir/calendario.ics" "Weekly Exclusions" "RRULE:FREQ=WEEKLY;UNTIL=20300204T100000;BYDAY=MO,WE" || return 1
+    event_has_line "$backup_dir/calendario.ics" "Monthly Exclusions" "RRULE:FREQ=MONTHLY;UNTIL=20300615T180000;BYMONTHDAY=15" || return 1
+    event_has_line "$backup_dir/calendario.ics" "Yearly Exclusions" "RRULE:FREQ=YEARLY;UNTIL=20330220T120000;BYMONTH=2;BYMONTHDAY=20" || return 1
+
+    event_has_line "$backup_dir/calendario.ics" "Daily Exclusions" "EXDATE:20300103T090000,20300107T090000,20300109T090000" || return 1
+    event_has_line "$backup_dir/calendario.ics" "Weekly Exclusions" "EXDATE:20300109T100000,20300114T100000,20300130T100000" || return 1
+    event_has_line "$backup_dir/calendario.ics" "Monthly Exclusions" "EXDATE:20300215T180000,20300515T180000" || return 1
+    event_has_line "$backup_dir/calendario.ics" "Yearly Exclusions" "EXDATE:20310220T120000,20330220T120000" || return 1
+
+    install_proton_fixture recurrence-series-proton-exdates.ics
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "No changes to apply. The calendars are synchronized!" || return 1
+    assert_not_contains "$output_file" "with different exclusions" || return 1
+}
+
+test_recurring_alarm_removal_preserves_recurrence() {
+    begin_case recurring_alarm_removal
+    seed_calcurse palestra-proton-no-fridays.ics || return 1
+    install_proton_fixture palestra-proton-no-fridays.ics
+
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_state_value 1 || return 1
+
+    install_proton_fixture palestra-proton-no-fridays-no-alarm.ics
+    local apts_before state_before
+    local state_file="$test_home/.local/state/calcurse-sync/alarm-state.tsv"
+    apts_before=$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)
+    state_before=$(sha256sum "$state_file" | cut -d' ' -f1)
+
+    run_sync $'A\nR\n' --dry-run
+    assert_status 0 || return 1
+    assert_contains "$output_file" "whose Proton notification was removed" || return 1
+    assert_contains "$output_file" "Notifications to remove from Calcurse: 1" || return 1
+    [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
+    [[ "$state_before" == "$(sha256sum "$state_file" | cut -d' ' -f1)" ]] || return 1
+
+    run_sync $'A\nR\ny\n'
+    assert_status 0 || return 1
+    assert_state_value 0 || return 1
+    event_lacks_line "$backup_dir/calendario.ics" "Palestra" "BEGIN:VALARM" || return 1
+    assert_contains "$backup_dir/calendario.ics" "RRULE:FREQ=WEEKLY" || return 1
+
+    local friday
+    for friday in 20300906 20300913 20300920 20300927; do
+        assert_contains "$backup_dir/calendario.ics" "$friday" || return 1
+    done
+
+    install_proton_fixture palestra-proton-no-fridays-no-alarm.ics
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "No changes to apply. The calendars are synchronized!" || return 1
     assert_not_contains "$output_file" "whose Proton notification was removed" || return 1
 }
 
@@ -454,9 +574,12 @@ run_test "Proton import and second-pass idempotence" test_proton_import_and_idem
 run_test "Calcurse-only event export" test_calcurse_export
 run_test "Proton monthly BYDAY normalization" test_proton_monthly_byday_normalization
 run_test "Recurring EXDATE update with alarm" test_recurring_exdate_and_alarm
+run_test "Recurring EXDATE daily/weekly/monthly/yearly" test_recurring_exdate_frequency_matrix
+run_test "Proton-compatible recurring EXDATE export" test_proton_recurrence_export_compatibility
 run_test "Alarm backfill compatibility filters" test_alarm_backfill_filters
 run_test "Alarm removal baseline and dry-run" test_alarm_removal_state
 run_test "Alarm removal postpone and keep choices" test_alarm_removal_postpone_and_keep
+run_test "Recurring alarm removal preserves recurrence" test_recurring_alarm_removal_preserves_recurrence
 run_test "Invalid alarm state is rebuilt safely" test_invalid_alarm_state_is_safe
 run_test "Dry-run preserves files and Calcurse data" test_dry_run_preserves_everything
 run_test "Atomic failure preserves appointments/TODO" test_atomic_failure_preserves_data
