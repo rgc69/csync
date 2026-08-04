@@ -48,7 +48,7 @@ Run the guided analysis without modifying Calcurse or any calendar file:
 Choose Option A and answer the usual guided questions. The script displays the
 complete change summary, but does not rename the Proton download, create a
 backup, update Calcurse, write synchronization state, or generate a Proton
-export or deletion report. Complete sync (Option B) is disabled in this mode.
+export. Complete sync (Option B) is disabled in this mode.
 
 ## 🧭 Menu Options
 
@@ -159,18 +159,20 @@ monthly/yearly rules match the forms found in Proton's own exports.
 
 - The first successful Option A run creates an event baseline without inferring
   deletions. It stores only hashed identifiers for events known to be present in
-  both calendars or imported into Calcurse during that run.
+  both calendars, imported into Calcurse, or confirmed for export to Proton
+  during that run.
 - The mechanism is independent of event origin: it works after both
-  Calcurse → Proton and Proton → Calcurse synchronization, provided that a
-  successful Option A run has observed the event on both sides.
-- If a baseline event is later present only in Proton, Option A asks whether to
-  add it to the manual Proton deletion report (`D`), restore it into Calcurse
-  (`R`), or postpone the decision (`S`). Nothing is deleted automatically.
-- Confirmed deletions are written to
-  `~/Projects/calendar/eventi-da-cancellare-proton.txt`. This is deliberately a
-  text report, not an ICS file: delete the listed events manually in Proton,
-  export Proton again, and rerun Option A. Once Proton no longer contains the
-  events, the stale report is removed.
+  Calcurse → Proton and Proton → Calcurse synchronization. Events confirmed for
+  export are recorded immediately; for exports created before this baseline was
+  introduced, the UID in the latest `nuovi-appuntamenti-calcurse.ics` is used as
+  a migration fallback when the same UID is found in Proton.
+- If a baseline event is later present only in Proton, Option A offers to
+  restore it into Calcurse (`R`). Pressing Enter leaves Calcurse unchanged,
+  reports that the calendars are not fully synchronized, and asks again on the
+  next run while the event still exists in Proton.
+- If the event is deleted manually from Proton, it disappears from the next
+  Proton export; Option A then removes it from the baseline, stops asking, and
+  can report the calendars as synchronized again.
 - The baseline is stored at
   `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/event-state.tsv` and is
   updated only after a successful normal Option A run. Cancellation, failure,
@@ -253,8 +255,6 @@ Choice: P
   `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/alarm-state.tsv`
 - **Event baseline**:
   `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/event-state.tsv`
-- **Manual Proton deletion report**:
-  `~/Projects/calendar/eventi-da-cancellare-proton.txt`
 
 ***
 
