@@ -126,6 +126,25 @@ assert_state_value() {
     fi
 }
 
+assert_event_state_count() {
+    local expected="$1"
+    local state_file="$test_home/.local/state/calcurse-sync/event-state.tsv"
+
+    [[ -f "$state_file" ]] || {
+        printf 'Event state file was not created: %s\n' "$state_file" >&2
+        return 1
+    }
+    if ! awk -v expected="$expected" '
+        NR == 1 { valid_header = ($0 == "calcurse-sync-event-state\t1"); next }
+        length($0) == 32 && $0 ~ /^[0-9a-f]+$/ { matches++; next }
+        NF { invalid = 1 }
+        END { exit(valid_header && !invalid && matches == expected ? 0 : 1) }
+    ' "$state_file"; then
+        printf 'Expected %s synchronized event state entries\n' "$expected" >&2
+        return 1
+    fi
+}
+
 assert_line_count() {
     local expected="$1"
     local line="$2"
@@ -461,6 +480,85 @@ test_invalid_alarm_state_is_safe() {
     [[ "$apts_before" == "$(sha256sum "$calcurse_dir/apts" | cut -d' ' -f1)" ]] || return 1
 }
 
+test_proton_origin_deletion_report() {
+    begin_case proton_origin_deletion
+    install_proton_fixture proton-new.ics
+
+    run_sync $'A\ny\ny\n'
+    assert_status 0 || return 1
+    assert_event_state_count 1 || return 1
+
+    : > "$calcurse_dir/apts"
+    install_proton_fixture proton-new.ics
+    run_sync $'A\nS\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Previously synchronized event no longer present in Calcurse" || return 1
+    assert_contains "$output_file" "Decision postponed" || return 1
+    assert_event_state_count 1 || return 1
+    [[ ! -e "$backup_dir/eventi-da-cancellare-proton.txt" ]] || return 1
+
+    install_proton_fixture proton-new.ics
+    local state_file="$test_home/.local/state/calcurse-sync/event-state.tsv"
+    local state_before
+    state_before=$(sha256sum "$state_file" | cut -d' ' -f1)
+    run_sync $'A\nD\n' --dry-run
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Events to delete manually from Proton: 1" || return 1
+    [[ "$state_before" == "$(sha256sum "$state_file" | cut -d' ' -f1)" ]] || return 1
+    [[ ! -e "$backup_dir/eventi-da-cancellare-proton.txt" ]] || {
+        printf 'Dry-run created the Proton deletion report\n' >&2
+        return 1
+    }
+
+    run_sync $'A\nD\ny\n'
+    assert_status 0 || return 1
+    local report="$backup_dir/eventi-da-cancellare-proton.txt"
+    [[ -f "$report" ]] || return 1
+    [[ "$(stat -c %a "$report")" == "600" ]] || return 1
+    assert_contains "$report" "Proton New Event" || return 1
+    assert_contains "$report" "UID: proton-new@test" || return 1
+    assert_contains "$report" "This is not an ICS import file" || return 1
+    assert_event_state_count 1 || return 1
+
+    install_proton_fixture empty.ics
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "No changes to apply. The calendars are synchronized!" || return 1
+    [[ ! -e "$report" ]] || {
+        printf 'Confirmed Proton deletion left a stale report\n' >&2
+        return 1
+    }
+    assert_event_state_count 0 || return 1
+}
+
+test_calcurse_origin_deletion_report() {
+    begin_case calcurse_origin_deletion
+    seed_calcurse calcurse-new.ics || return 1
+    install_proton_fixture empty.ics
+
+    run_sync $'A\nB\ny\n'
+    assert_status 0 || return 1
+    local proton_copy="$case_dir/calcurse-origin-proton.ics"
+    cp "$backup_dir/nuovi-appuntamenti-calcurse.ics" "$proton_copy"
+
+    cp "$proton_copy" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "No changes to apply. The calendars are synchronized!" || return 1
+    assert_event_state_count 1 || return 1
+
+    : > "$calcurse_dir/apts"
+    cp "$proton_copy" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\nD\ny\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "Previously synchronized event no longer present in Calcurse" || return 1
+
+    local report="$backup_dir/eventi-da-cancellare-proton.txt"
+    [[ -f "$report" ]] || return 1
+    assert_contains "$report" "Calcurse New Event" || return 1
+    assert_contains "$report" "UID: CALCURSE-" || return 1
+}
+
 test_dry_run_preserves_everything() {
     begin_case dry_run
     seed_calcurse calcurse-new.ics || return 1
@@ -500,6 +598,14 @@ test_dry_run_preserves_everything() {
     [[ ! -e "$backup_dir/nuovi-appuntamenti-calcurse.ics" ]] || return 1
     [[ ! -e "$test_home/.local/state/calcurse-sync/alarm-state.tsv" ]] || {
         printf 'Dry-run created alarm synchronization state\n' >&2
+        return 1
+    }
+    [[ ! -e "$test_home/.local/state/calcurse-sync/event-state.tsv" ]] || {
+        printf 'Dry-run created event synchronization state\n' >&2
+        return 1
+    }
+    [[ ! -e "$backup_dir/eventi-da-cancellare-proton.txt" ]] || {
+        printf 'Dry-run created a Proton deletion report\n' >&2
         return 1
     }
     local backups=("$backup_dir"/backup_*.ics)
@@ -581,6 +687,8 @@ run_test "Alarm removal baseline and dry-run" test_alarm_removal_state
 run_test "Alarm removal postpone and keep choices" test_alarm_removal_postpone_and_keep
 run_test "Recurring alarm removal preserves recurrence" test_recurring_alarm_removal_preserves_recurrence
 run_test "Invalid alarm state is rebuilt safely" test_invalid_alarm_state_is_safe
+run_test "Proton-origin event deletion report" test_proton_origin_deletion_report
+run_test "Calcurse-origin event deletion report" test_calcurse_origin_deletion_report
 run_test "Dry-run preserves files and Calcurse data" test_dry_run_preserves_everything
 run_test "Atomic failure preserves appointments/TODO" test_atomic_failure_preserves_data
 

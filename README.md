@@ -12,6 +12,7 @@ Manual synchronization between Proton Calendar and Calcurse (no official sync av
 | 🎯 **Recurring Events Management** | Supports EXDATE (excluded occurrences) |
 | 🚀 **Optimized Performance** | Hash-based O(n) comparison |
 | 🚨 **Smart Alarm Conversion** | Normalizes reminders between systems |
+| 🗑️ **Deletion Detection** | Recognizes events removed from Calcurse after synchronization |
 | 💾 **Automatic Backups** | Rotation of the last 3 backups |
 | 🛡️ **Safe by Default** | Option A is the recommended daily/weekly flow |
 
@@ -47,7 +48,7 @@ Run the guided analysis without modifying Calcurse or any calendar file:
 Choose Option A and answer the usual guided questions. The script displays the
 complete change summary, but does not rename the Proton download, create a
 backup, update Calcurse, write synchronization state, or generate a Proton
-export. Complete sync (Option B) is disabled in this mode.
+export or deletion report. Complete sync (Option B) is disabled in this mode.
 
 ## 🧭 Menu Options
 
@@ -113,7 +114,8 @@ database. Set `KEEP_TEST_TMP=1` to retain the temporary files after a run.
 Covered flows include guided import and export, second-pass idempotence,
 daily, weekly, monthly, and yearly `EXDATE` updates, Proton-compatible
 recurrence export, compatible alarm backfill and removal, persistent-state
-decisions, recurring alarm removal without `RRULE`/`EXDATE` loss, dry-run
+decisions, deletion detection for events originating in either Proton or
+Calcurse, recurring alarm removal without `RRULE`/`EXDATE` loss, dry-run
 preservation, unsupported alarm filters, and atomic failure preservation for
 appointments and TODO items.
 
@@ -152,6 +154,27 @@ occurrences, within Proton Calendar's current
 and custom recurrence limits. Timed `EXDATE` values are exported with the same
 `TZID` as `DTSTART`, date-time `UNTIL` values are emitted in UTC, and simple
 monthly/yearly rules match the forms found in Proton's own exports.
+
+### Event Deletion Detection
+
+- The first successful Option A run creates an event baseline without inferring
+  deletions. It stores only hashed identifiers for events known to be present in
+  both calendars or imported into Calcurse during that run.
+- The mechanism is independent of event origin: it works after both
+  Calcurse → Proton and Proton → Calcurse synchronization, provided that a
+  successful Option A run has observed the event on both sides.
+- If a baseline event is later present only in Proton, Option A asks whether to
+  add it to the manual Proton deletion report (`D`), restore it into Calcurse
+  (`R`), or postpone the decision (`S`). Nothing is deleted automatically.
+- Confirmed deletions are written to
+  `~/Projects/calendar/eventi-da-cancellare-proton.txt`. This is deliberately a
+  text report, not an ICS file: delete the listed events manually in Proton,
+  export Proton again, and rerun Option A. Once Proton no longer contains the
+  events, the stale report is removed.
+- The baseline is stored at
+  `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/event-state.tsv` and is
+  updated only after a successful normal Option A run. Cancellation, failure,
+  and `--dry-run` leave it unchanged.
 
 ### Alarm Conversion
 
@@ -228,6 +251,10 @@ Choice: P
 - **Export**: `~/Projects/calendar/calcurse-export-to-proton.ics`
 - **Alarm state**:
   `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/alarm-state.tsv`
+- **Event baseline**:
+  `${XDG_STATE_HOME:-$HOME/.local/state}/calcurse-sync/event-state.tsv`
+- **Manual Proton deletion report**:
+  `~/Projects/calendar/eventi-da-cancellare-proton.txt`
 
 ***
 
