@@ -270,6 +270,22 @@ test_proton_monthly_byday_normalization() {
         "RRULE:FREQ=WEEKLY;UNTIL=20261101T170000Z;BYDAY=MO" || return 1
 }
 
+test_proton_daily_byday_normalization() {
+    begin_case proton_daily_byday
+    seed_calcurse daily-byday-calcurse.ics || return 1
+    install_proton_fixture empty.ics
+
+    run_sync $'A\nB\ny\n'
+
+    assert_status 0 || return 1
+
+    local export_file="$backup_dir/nuovi-appuntamenti-calcurse.ics"
+    assert_line_count 1 "BEGIN:VEVENT" "$export_file" || return 1
+    event_has_line "$export_file" "Daily BYDAY Export" \
+        "RRULE:FREQ=WEEKLY;UNTIL=20270131T190000Z;BYDAY=MO,WE,FR" || return 1
+    assert_not_contains "$export_file" "RRULE:FREQ=DAILY;" || return 1
+}
+
 test_recurring_exdate_and_alarm() {
     begin_case recurring_exdate
     seed_calcurse palestra-calcurse.ics || return 1
@@ -702,6 +718,7 @@ run_test "Proton import and second-pass idempotence" test_proton_import_and_idem
 run_test "Folded ICS parsing and idempotence" test_folded_ics_import_and_idempotence
 run_test "Calcurse-only event export" test_calcurse_export
 run_test "Proton monthly BYDAY normalization" test_proton_monthly_byday_normalization
+run_test "Proton DAILY+BYDAY normalization" test_proton_daily_byday_normalization
 run_test "Recurring EXDATE update with alarm" test_recurring_exdate_and_alarm
 run_test "Recurring EXDATE daily/weekly/monthly/yearly" test_recurring_exdate_frequency_matrix
 run_test "Proton-compatible recurring EXDATE export" test_proton_recurrence_export_compatibility
