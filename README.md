@@ -112,12 +112,21 @@ directory for every scenario. It never reads or modifies the user's Calcurse
 database. Set `KEEP_TEST_TMP=1` to retain the temporary files after a run.
 
 Covered flows include guided import and export, second-pass idempotence,
-daily, weekly, monthly, and yearly `EXDATE` updates, Proton-compatible
+folded ICS properties with CRLF input, daily, weekly, monthly, and yearly
+`EXDATE` updates, Proton-compatible
 recurrence export, compatible alarm backfill and removal, persistent-state
 decisions, deletion detection for events originating in either Proton or
 Calcurse, recurring alarm removal without `RRULE`/`EXDATE` loss, dry-run
 preservation, unsupported alarm filters, and atomic failure preservation for
 appointments and TODO items.
+
+### ICS Parsing
+
+Before comparison, physical ICS lines are unfolded into complete logical
+properties and trailing CR characters are removed. This is performed in one
+linear `awk` pass while extracting `VEVENT` blocks, replacing the previous
+`awk | tr` pipeline. Strict parser validation remains in the integration suite
+and is not run during normal synchronization.
 
 ### Event Normalization
 

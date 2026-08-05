@@ -1,0 +1,24 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//calcurse-sync folded parsing tests//EN
+BEGIN:VEVENT
+UID:folded-event@
+ example.test
+DTSTART;TZID=Europe/
+ Rome:20360515T090000
+DTEND;TZID=Europe/
+ Rome:20360515T100000
+SUMMARY:Folded planning 
+ session
+DESCRIPTION:First line 
+ second line
+LOCATION:Meeting 
+ room
+BEGIN:VALARM
+TRIGGER:-PT
+ 15M
+ACTION:DISPLAY
+DESCRIPTION:Folded planning session
+END:VALARM
+END:VEVENT
+END:VCALENDAR

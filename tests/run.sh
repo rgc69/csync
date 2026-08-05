@@ -220,6 +220,32 @@ test_proton_import_and_idempotence() {
     }
 }
 
+test_folded_ics_import_and_idempotence() {
+    begin_case folded_ics
+    install_proton_fixture folded-proton.ics
+
+    if command -v icalendar >/dev/null 2>&1; then
+        icalendar "$backup_dir/My Calendar-test.ics" >/dev/null || {
+            printf 'The folded fixture is not valid iCalendar\n' >&2
+            return 1
+        }
+    fi
+
+    run_sync $'A\ny\ny\n'
+    assert_status 0 || return 1
+    local export_file="$backup_dir/calendario.ics"
+    assert_line_count 1 "BEGIN:VEVENT" "$export_file" || return 1
+    assert_contains "$export_file" "SUMMARY:Folded planning session" || return 1
+    assert_contains "$export_file" "DESCRIPTION:First line second line" || return 1
+    assert_contains "$export_file" "LOCATION:Meeting room" || return 1
+    event_has_line "$export_file" "Folded planning session" "BEGIN:VALARM" || return 1
+
+    install_proton_fixture folded-proton.ics
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" "No changes to apply. The calendars are synchronized!" || return 1
+}
+
 test_calcurse_export() {
     begin_case calcurse_export
     seed_calcurse calcurse-new.ics || return 1
@@ -673,6 +699,7 @@ if ! command -v "$CALCURSE_BIN" >/dev/null 2>&1; then
 fi
 
 run_test "Proton import and second-pass idempotence" test_proton_import_and_idempotence
+run_test "Folded ICS parsing and idempotence" test_folded_ics_import_and_idempotence
 run_test "Calcurse-only event export" test_calcurse_export
 run_test "Proton monthly BYDAY normalization" test_proton_monthly_byday_normalization
 run_test "Recurring EXDATE update with alarm" test_recurring_exdate_and_alarm

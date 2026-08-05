@@ -46,6 +46,49 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# ICS LINE UNFOLDING AND VEVENT EXTRACTION
+# ----------------------------------------------------------------------
+extract_vevents_unfolded() {
+    local input_file="$1"
+    [[ -f "$input_file" ]] || return 1
+
+    LC_ALL=C awk '
+        function emit(value) {
+            if (value == "BEGIN:VEVENT") {
+                in_event = 1
+            }
+            if (in_event) {
+                print value
+            }
+            if (value == "END:VEVENT") {
+                in_event = 0
+            }
+        }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+
+            if (have_line && line ~ /^[ \t]/) {
+                sub(/^[ \t]/, "", line)
+                logical_line = logical_line line
+                next
+            }
+
+            if (have_line) {
+                emit(logical_line)
+            }
+            logical_line = line
+            have_line = 1
+        }
+        END {
+            if (have_line) {
+                emit(logical_line)
+            }
+        }
+    ' "$input_file"
+}
+
+# ----------------------------------------------------------------------
 # FUNZIONE PULIZIA BACKUP
 # ----------------------------------------------------------------------
 clean_old_backups() {
@@ -699,7 +742,7 @@ sanitize_calendar_for_calcurse_import() {
     [[ -f "$input_file" ]] || return 1
 
     local tmp_events=$(mktemp)
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$input_file" | tr -d '\r' > "$tmp_events"
+    extract_vevents_unfolded "$input_file" > "$tmp_events"
 
     {
         echo "BEGIN:VCALENDAR"
@@ -1544,8 +1587,8 @@ find_new_events() {
     local calcurse_tmp=$(mktemp)
     local out_tmp=$(mktemp)
 
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$proton_file" | tr -d '\r' > "$proton_tmp"
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$calcurse_file" | tr -d '\r' > "$calcurse_tmp"
+    extract_vevents_unfolded "$proton_file" > "$proton_tmp"
+    extract_vevents_unfolded "$calcurse_file" > "$calcurse_tmp"
 
     declare -A proton_hashes
     declare -A proton_uids
@@ -1735,7 +1778,7 @@ filter_events_by_date() {
     echo "VERSION:2.0" >> "$filtered_temp"
     echo "PRODID:-//calcurse-sync//Filtro Temporale//" >> "$filtered_temp"
 
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$input_file" | tr -d '\r' > "$temp_file"
+    extract_vevents_unfolded "$input_file" > "$temp_file"
 
     local event_block=""
     local in_event=0
@@ -1898,8 +1941,8 @@ option_A() {
     local proton_tmp=$(mktemp)
     local calcurse_tmp=$(mktemp)
 
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$IMPORT_FILE" | tr -d '\r' > "$proton_tmp"
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$comparison_export" | tr -d '\r' > "$calcurse_tmp"
+    extract_vevents_unfolded "$IMPORT_FILE" > "$proton_tmp"
+    extract_vevents_unfolded "$comparison_export" > "$calcurse_tmp"
 
     # Indicizzazione Proton
     declare -A proton_events
@@ -2921,8 +2964,8 @@ option_B() {
     local proton_tmp=$(mktemp)
     local calcurse_tmp=$(mktemp)
 
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$proton_file_normalized" | tr -d '\r' > "$proton_tmp"
-    awk '/^BEGIN:VEVENT/,/^END:VEVENT/' "$current_calcurse_export" | tr -d '\r' > "$calcurse_tmp"
+    extract_vevents_unfolded "$proton_file_normalized" > "$proton_tmp"
+    extract_vevents_unfolded "$current_calcurse_export" > "$calcurse_tmp"
 
     declare -A calcurse_hashes
     declare -A calcurse_uids
