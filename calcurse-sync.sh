@@ -18,10 +18,19 @@ ALARM_STATE_VERSION=1
 EVENT_STATE_FILE="$STATE_DIR/event-state.tsv"
 EVENT_STATE_VERSION=1
 DRY_RUN=0
+SYNC_TIMEZONE="${TZ:-Europe/Rome}"
+export TZ="$SYNC_TIMEZONE"
+STAGED_PROTON_EXPORT=""
+SYNC_TEMP_FILES=()
+trap 'rm -f -- "${SYNC_TEMP_FILES[@]}"; [[ -z "$STAGED_PROTON_EXPORT" ]] || rm -f -- "$STAGED_PROTON_EXPORT"' EXIT
 
 die() {
     echo "❌ Errore: $1" >&2
     exit 1
+}
+
+warn() {
+    printf 'Warning: %s\n' "$1" >&2
 }
 
 show_usage() {
@@ -53,7 +62,33 @@ extract_vevents_unfolded() {
     [[ -f "$input_file" ]] || return 1
 
     LC_ALL=C awk '
+        function fail(message) {
+            print "Invalid or unsupported calendar: " message > "/dev/stderr"
+            invalid = 1
+            exit 1
+        }
         function emit(value) {
+            if (value == "") return
+            if (value ~ /^BEGIN:/) {
+                component = substr(value, 7)
+                if (depth == 0) {
+                    if (component != "VCALENDAR" || calendars++) fail("expected one VCALENDAR")
+                } else if (component == "VCALENDAR") fail("nested VCALENDAR")
+                if (component == "VEVENT" && (depth != 1 || stack[depth] != "VCALENDAR"))
+                    fail("misplaced VEVENT")
+                stack[++depth] = component
+            } else if (value ~ /^END:/) {
+                if (depth == 0 || stack[depth] != substr(value, 5)) fail("unbalanced component")
+                delete stack[depth--]
+            } else {
+                if (!depth) fail("content outside VCALENDAR")
+                if (depth == 1 && value == "VERSION:2.0") version++
+                if (stack[depth] == "VEVENT") {
+                    if (value ~ /^RECURRENCE-ID[:;]/) fail("RECURRENCE-ID is not supported; no events were imported")
+                    if (value ~ /^RDATE[:;]/) fail("RDATE is not supported")
+                    if (value ~ /^UID:/ && seen_uid[substr(value, 5)]++) fail("duplicate VEVENT UID")
+                }
+            }
             if (value == "BEGIN:VEVENT") {
                 in_event = 1
             }
@@ -81,9 +116,11 @@ extract_vevents_unfolded() {
             have_line = 1
         }
         END {
-            if (have_line) {
+            if (!invalid && have_line) {
                 emit(logical_line)
             }
+            if (invalid) exit 1
+            if (depth || calendars != 1 || version != 1) fail("incomplete VCALENDAR or missing VERSION:2.0")
         }
     ' "$input_file"
 }
@@ -109,13 +146,14 @@ find_and_prepare_proton_file() {
     proton_file=$(find "$BACKUP_DIR" -maxdepth 1 \( -name "My calendar-*.ics" -o -name "My Calendar-*.ics" \) -type f | sort -r | head -n1)
 
     if [[ -n "$proton_file" ]]; then
+        extract_vevents_unfolded "$proton_file" >/dev/null || die "Proton calendar validation failed"
         if [[ $DRY_RUN -eq 1 ]]; then
             IMPORT_FILE="$proton_file"
         else
-            mv "$proton_file" "$IMPORT_FILE"
+            mv -T -- "$proton_file" "$IMPORT_FILE" || die "Unable to prepare Proton calendar"
         fi
     elif [[ -f "$IMPORT_FILE" ]]; then
-        :
+        extract_vevents_unfolded "$IMPORT_FILE" >/dev/null || die "Proton calendar validation failed"
     else
         die "No Proton file found and $IMPORT_FILE does not exist"
     fi
@@ -265,6 +303,57 @@ normalize_alarms() {
 # (calcurse è molto severo su EXDATE/TZID e sull'ordine di alcuni campi)
 # ----------------------------------------------------------------------
 
+ics_datetime_to_local() {
+    local _dt_value="${1#*:}" _dt_params="${1%%:*}" _dt_zone="$SYNC_TIMEZONE"
+    if [[ "$_dt_value" == *Z ]]; then
+        _dt_zone=UTC
+        _dt_value="${_dt_value%Z}"
+    elif [[ "$_dt_params" == *TZID=* ]]; then
+        _dt_zone="${_dt_params#*TZID=}"
+        _dt_zone="${_dt_zone%%;*}"
+        _dt_zone="${_dt_zone//\"/}"
+    fi
+    [[ "$_dt_value" =~ ^[0-9]{8}T[0-9]{6}$ ]] || return 1
+    if [[ "$_dt_zone" != "$SYNC_TIMEZONE" ]]; then
+        [[ "$_dt_zone" != *..* && -f "/usr/share/zoneinfo/$_dt_zone" ]] || {
+            warn "Unknown calendar timezone: $_dt_zone"
+            return 1
+        }
+        local _dt_epoch
+        _dt_epoch=$(TZ="$_dt_zone" date -d "${_dt_value:0:4}-${_dt_value:4:2}-${_dt_value:6:2} ${_dt_value:9:2}:${_dt_value:11:2}:${_dt_value:13:2}" +%s) || return 1
+        _dt_value=$(TZ="$SYNC_TIMEZONE" date -d "@$_dt_epoch" +%Y%m%dT%H%M%S) || return 1
+    fi
+    printf -v "$2" '%s' "$_dt_value"
+}
+
+check_recurrence_timezone() {
+    local dtstart="$1" params="${1%%:*}" zone="$SYNC_TIMEZONE"
+    if [[ "$dtstart" == *Z ]]; then
+        zone=UTC
+    elif [[ "$params" == *TZID=* ]]; then
+        zone="${params#*TZID=}"
+        zone="${zone%%;*}"
+        zone="${zone//\"/}"
+    fi
+    # A recurring wall time cannot generally be moved between timezones:
+    # their DST transitions may differ across the lifetime of the series.
+    [[ "$zone" == "$SYNC_TIMEZONE" ]] || {
+        warn "Recurring events in timezone $zone cannot be safely converted to $SYNC_TIMEZONE"
+        return 1
+    }
+}
+
+ics_duration_seconds() {
+    local _dur="$1" _days=0 _hours=0 _minutes=0 _seconds=0 _weeks=0
+    [[ "$_dur" =~ ^P([0-9]+W|([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+S)?)?)$ && "$_dur" != P && "$_dur" != PT ]] || return 1
+    [[ "$_dur" =~ ([0-9]+)W ]] && _weeks=$((10#${BASH_REMATCH[1]}))
+    [[ "$_dur" =~ ([0-9]+)D ]] && _days=$((10#${BASH_REMATCH[1]}))
+    [[ "$_dur" =~ ([0-9]+)H ]] && _hours=$((10#${BASH_REMATCH[1]}))
+    [[ "$_dur" =~ ([0-9]+)M ]] && _minutes=$((10#${BASH_REMATCH[1]}))
+    [[ "$_dur" =~ ([0-9]+)S ]] && _seconds=$((10#${BASH_REMATCH[1]}))
+    printf -v "$2" '%s' "$((_weeks * 604800 + _days * 86400 + _hours * 3600 + _minutes * 60 + _seconds))"
+}
+
 _ics_clean_datetime_value() {
     # Input: YYYYMMDDTHHMMSS[Z] oppure varianti con timezone/parametri già rimossi
     # Output: YYYYMMDDTHHMMSS (senza Z)
@@ -310,22 +399,26 @@ _ics_clean_date_value() {
     echo "$out"
 }
 
+ics_elapsed_seconds() {
+    local _elapsed_start="$1" _elapsed_end="$2"
+    local _elapsed_lines
+    _elapsed_lines="${_elapsed_start:0:4}-${_elapsed_start:4:2}-${_elapsed_start:6:2} ${_elapsed_start:9:2}:${_elapsed_start:11:2}:${_elapsed_start:13:2}"
+    _elapsed_lines+=$'\n'"${_elapsed_end:0:4}-${_elapsed_end:4:2}-${_elapsed_end:6:2} ${_elapsed_end:9:2}:${_elapsed_end:11:2}:${_elapsed_end:13:2}"
+    local -a _elapsed_epochs
+    mapfile -t _elapsed_epochs < <(date -f - +%s <<< "$_elapsed_lines")
+    [[ ${#_elapsed_epochs[@]} -eq 2 ]] || return 1
+    (( _elapsed_epochs[1] >= _elapsed_epochs[0] )) || return 1
+    printf -v "$3" '%s' "$((_elapsed_epochs[1] - _elapsed_epochs[0]))"
+}
+
 _ics_duration_from_dtstart_dtend() {
     # Input: dtstart dtend in YYYYMMDDTHHMMSS (floating/local)
     # Output: RFC5545 duration like P0DT1H30M0S
     local s="$1"
     local e="$2"
 
-    # Convert to "YYYY-MM-DD HH:MM:SS"
-    local s_iso="${s:0:4}-${s:4:2}-${s:6:2} ${s:9:2}:${s:11:2}:${s:13:2}"
-    local e_iso="${e:0:4}-${e:4:2}-${e:6:2} ${e:9:2}:${e:11:2}:${e:13:2}"
-
-    local s_epoch e_epoch diff
-    s_epoch=$(date -d "$s_iso" +%s 2>/dev/null) || return 1
-    e_epoch=$(date -d "$e_iso" +%s 2>/dev/null) || return 1
-    diff=$(( e_epoch - s_epoch ))
-    # Cross-midnight safety
-    [[ $diff -lt 0 ]] && diff=$(( diff + 86400 ))
+    local diff
+    ics_elapsed_seconds "$s" "$e" diff || return 1
 
     local days=$(( diff / 86400 ))
     local rem=$(( diff % 86400 ))
@@ -385,7 +478,7 @@ event_is_timed() {
     while IFS= read -r line; do
         line="${line%$'\r'}"
         [[ "$line" == DTSTART* ]] || continue
-        [[ "$line" != *"VALUE=DATE"* && "${line#*:}" == *"T"* ]]
+        [[ ! "${line%%:*}" =~ (^|\;)VALUE=DATE(\;|$) && "${line#*:}" == *"T"* ]]
         return
     done <<< "$event_block"
     return 1
@@ -518,7 +611,7 @@ save_alarm_state() {
         }
     done
 
-    if ! mv -f "$tmp" "$ALARM_STATE_FILE"; then
+    if ! mv -Tf "$tmp" "$ALARM_STATE_FILE"; then
         rm -f "$tmp"
         return 1
     fi
@@ -573,7 +666,7 @@ save_event_state() {
         }
     done
 
-    if ! mv -f "$tmp" "$EVENT_STATE_FILE"; then
+    if ! mv -Tf "$tmp" "$EVENT_STATE_FILE"; then
         rm -f "$tmp"
         return 1
     fi
@@ -620,11 +713,11 @@ sanitize_vevent_for_calcurse() {
     # DTSTART parse + type
     local dtstart_val="$(echo "$dtstart_raw" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')"
     local is_allday=0
-    if echo "$dtstart_raw" | grep -q "VALUE=DATE" || [[ "$dtstart_val" != *"T"* ]]; then
+    if [[ "${dtstart_raw%%:*}" =~ (^|\;)VALUE=DATE(\;|$) || "$dtstart_val" != *"T"* ]]; then
         is_allday=1
         dtstart_val="$(_ics_clean_date_value "$dtstart_val")"
     else
-        dtstart_val="$(_ics_clean_datetime_value "$dtstart_val")"
+        ics_datetime_to_local "$dtstart_raw" dtstart_val || return 1
     fi
 
     # DTEND parse
@@ -634,14 +727,18 @@ sanitize_vevent_for_calcurse() {
         if [[ $is_allday -eq 1 ]]; then
             dtend_val="$(_ics_clean_date_value "$dtend_val")"
         else
-            dtend_val="$(_ics_clean_datetime_value "$dtend_val")"
+            ics_datetime_to_local "$dtend_raw" dtend_val || return 1
         fi
     fi
 
-    # RRULE: remove trailing Z from UNTIL if present (calcurse import is stricter)
     local rrule_out="$rrule_raw"
     if [[ -n "$rrule_out" ]]; then
-        rrule_out="$(echo "$rrule_out" | sed -E 's/UNTIL=([0-9]{8}T[0-9]{6})Z/UNTIL=\1/g' | sed -E 's/UNTIL=([0-9]{8})Z/UNTIL=\1/g')"
+        check_recurrence_timezone "$dtstart_raw" || return 1
+        if [[ "$rrule_out" =~ UNTIL=([0-9]{8}T[0-9]{6}Z) ]]; then
+            local until_utc="${BASH_REMATCH[1]}" until_local
+            ics_datetime_to_local "UNTIL:$until_utc" until_local || return 1
+            rrule_out="${rrule_out/UNTIL=$until_utc/UNTIL=$until_local}"
+        fi
     fi
 
     # EXDATE normalize (merge multiple EXDATE lines -> single line)
@@ -653,7 +750,14 @@ sanitize_vevent_for_calcurse() {
             if [[ $is_allday -eq 1 ]]; then
                 v="$(_ics_clean_date_value "$v")"
             else
-                v="$(_ics_clean_datetime_value "$v")"
+                local token converted=""
+                local -a date_tokens
+                IFS=',' read -ra date_tokens <<< "$v"
+                for token in "${date_tokens[@]}"; do
+                    ics_datetime_to_local "${exl%%:*}:$token" token || return 1
+                    converted+="${converted:+,}$token"
+                done
+                v="$converted"
             fi
             [[ -z "$v" ]] && continue
             if [[ -z "$merged" ]]; then
@@ -742,12 +846,13 @@ sanitize_calendar_for_calcurse_import() {
     [[ -f "$input_file" ]] || return 1
 
     local tmp_events=$(mktemp)
-    extract_vevents_unfolded "$input_file" > "$tmp_events"
+    if ! extract_vevents_unfolded "$input_file" > "$tmp_events"; then
+        rm -f "$tmp_events"
+        return 1
+    fi
 
-    {
-        echo "BEGIN:VCALENDAR"
-        echo "VERSION:2.0"
-        echo "PRODID:-//calcurse-sync//Sanitized for calcurse//"
+    if ! (
+        printf '%s\n' BEGIN:VCALENDAR VERSION:2.0 'PRODID:-//calcurse-sync//Sanitized for calcurse//' || exit 1
         local block="" in_event=0
         while IFS= read -r line; do
             if [[ "$line" == "BEGIN:VEVENT" ]]; then
@@ -755,15 +860,18 @@ sanitize_calendar_for_calcurse_import() {
                 in_event=1
             elif [[ "$line" == "END:VEVENT" ]]; then
                 block+=$'\n'"$line"
-                sanitize_vevent_for_calcurse "$block"
+                sanitize_vevent_for_calcurse "$block" || exit 1
                 in_event=0
                 block=""
             elif (( in_event )); then
                 block+=$'\n'"$line"
             fi
         done < "$tmp_events"
-        echo "END:VCALENDAR"
-    } > "$output_file"
+        echo "END:VCALENDAR" || exit 1
+    ) > "$output_file"; then
+        rm -f "$tmp_events"
+        return 1
+    fi
 
     rm -f "$tmp_events"
 }
@@ -908,11 +1016,6 @@ clean_rrule_for_proton() {
     local rrule="$1"
     local dtstart_line="${2:-}"
 
-    # Remove elements that do not affect the supported daily/weekly forms.
-    if [[ "$rrule" =~ FREQ=WEEKLY || "$rrule" =~ FREQ=DAILY ]]; then
-        rrule=$(echo "$rrule" | sed 's/;BYMONTH=[0-9]*//g' | sed 's/BYMONTH=[0-9]*;//g')
-    fi
-
     # These forms describe the same occurrence set as a weekly rule when the
     # interval is one and no additional monthly filter is present.
     local byday="" bymonth="" bymonthday="" bysetpos="" interval="1"
@@ -933,10 +1036,12 @@ clean_rrule_for_proton() {
         esac
     done
 
-    if [[ "$rrule" == *"FREQ=DAILY"* && -n "$byday" && "$interval" == "1" ]]; then
+    if [[ "$rrule" == *"FREQ=DAILY"* && "$interval" == "1" && \
+          $has_month_filter -eq 0 && $has_other_date_filter -eq 0 && \
+          "$byday" =~ ^(MO|TU|WE|TH|FR|SA|SU)(,(MO|TU|WE|TH|FR|SA|SU))*$ ]]; then
         rrule=${rrule/FREQ=DAILY/FREQ=WEEKLY}
     elif [[ "$rrule" == *"FREQ=MONTHLY"* && "$interval" == "1" && \
-            $has_month_filter -eq 0 && \
+            $has_month_filter -eq 0 && $has_other_date_filter -eq 0 && \
             "$byday" =~ ^(MO|TU|WE|TH|FR|SA|SU)(,(MO|TU|WE|TH|FR|SA|SU))*$ ]]; then
         rrule=${rrule/FREQ=MONTHLY/FREQ=WEEKLY}
     fi
@@ -945,7 +1050,7 @@ clean_rrule_for_proton() {
     # simple monthly/yearly rules omit them, so remove only exact redundancies.
     local dtstart_value="${dtstart_line#*:}"
     dtstart_value="${dtstart_value%Z}"
-    if [[ "$dtstart_value" =~ ^[0-9]{8}T ]]; then
+    if [[ "$dtstart_value" =~ ^[0-9]{8}(T|$) ]]; then
         local start_month=$((10#${dtstart_value:4:2}))
         local start_monthday=$((10#${dtstart_value:6:2}))
 
@@ -963,12 +1068,14 @@ clean_rrule_for_proton() {
         fi
     fi
 
-    # Remove recurrence parts Proton does not accept. The conversion above is
-    # deliberately completed before this cleanup so semantics are not inferred
-    # from an already truncated rule.
-    rrule=$(echo "$rrule" | sed 's/;BYSETPOS=[^;]*//g' | sed 's/BYSETPOS=[^;]*;//g')
-    rrule=$(echo "$rrule" | sed 's/;BY\(SECOND\|MINUTE\|HOUR\)=[^;]*//g')
-    rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g' | sed 's/WKST=[^;]*;//g')
+    # Omit only the default week start, or a week start with no interval effect.
+    if [[ "$rrule" == *WKST=* ]]; then
+        if [[ "$interval" == 1 ]]; then
+            rrule=$(echo "$rrule" | sed 's/;WKST=[^;]*//g')
+        else
+            rrule=$(echo "$rrule" | sed 's/;WKST=MO\(;\|$\)/\1/g')
+        fi
+    fi
 
     # A date-time UNTIL paired with a TZID DTSTART must be expressed in UTC.
     local dtstart_params="${dtstart_line%%:*}"
@@ -1010,6 +1117,18 @@ clean_event_rrules_for_proton() {
     done <<< "$event_block"
 
     printf '%s' "${cleaned%$'\n'}"
+}
+
+check_proton_export_rule() {
+    local block="$1" line
+    while IFS= read -r line; do
+        [[ "$line" == RRULE:* ]] || continue
+        if [[ "$line" =~ (\;|:)(BYMONTH|BYSETPOS|BYSECOND|BYMINUTE|BYHOUR|BYYEARDAY|BYWEEKNO|WKST)= ]] ||
+           [[ "$line" == *FREQ=DAILY* && "$line" == *BYDAY=* ]]; then
+            warn "Cannot safely export this recurrence to Proton: ${line#RRULE:}"
+            return 1
+        fi
+    done <<< "$block"
 }
 
 # ----------------------------------------------------------------------
@@ -1071,7 +1190,7 @@ enrich_event_for_proton() {
     while IFS= read -r line; do
         if [[ "$line" =~ ^DTSTART ]]; then
             # Estrai DTSTART preservando VALUE=DATE se presente
-            if [[ "$line" =~ VALUE=DATE ]]; then
+            if [[ "${line%%:*}" =~ (^|\;)VALUE=DATE(\;|$) ]]; then
                 dtstart=$(echo "$line" | sed 's/^DTSTART[^:]*://' | tr -d '\r\n ')
                 result+="DTSTART;VALUE=DATE:$dtstart"$'\n'
             else
@@ -1141,19 +1260,10 @@ enrich_event_for_proton() {
             fi
         elif [[ "$line" =~ ^DURATION:(.+) ]]; then
             duration="${BASH_REMATCH[1]}"
-            # Calcola DTEND (parsing semplificato)
-            local hours=0 minutes=0
-            [[ "$duration" =~ ([0-9]+)H ]] && hours=${BASH_REMATCH[1]}
-            [[ "$duration" =~ ([0-9]+)M ]] && minutes=${BASH_REMATCH[1]}
-
-            local total_minutes=$((hours * 60 + minutes))
-            local start_hour=${dtstart:9:2}
-            local start_min=${dtstart:11:2}
-            local end_minutes=$((10#$start_hour * 60 + 10#$start_min + total_minutes))
-            local end_hour=$((end_minutes / 60))
-            local end_min=$((end_minutes % 60))
-
-            dtend=$(printf "%s%02d%02d00" "${dtstart:0:9}" $end_hour $end_min)
+            local duration_seconds start_epoch
+            ics_duration_seconds "$duration" duration_seconds || return 1
+            start_epoch=$(TZ="$user_tz" date -d "${dtstart:0:4}-${dtstart:4:2}-${dtstart:6:2} ${dtstart:9:2}:${dtstart:11:2}:${dtstart:13:2}" +%s) || return 1
+            dtend=$(TZ="$user_tz" date -d "@$((start_epoch + duration_seconds))" +%Y%m%dT%H%M%S) || return 1
             result+="DTEND;TZID=$user_tz:$dtend"$'\n'
         elif [[ "$line" =~ ^UID: ]]; then
             result+="$line"$'\n'
@@ -1314,7 +1424,12 @@ build_event_identity_from_metadata() {
 export_calcurse_with_uids() {
     local destination="${1:-$EXPORT_FILE}"
     local temp_export=$(mktemp)
+    SYNC_TEMP_FILES+=("$temp_export")
     calcurse -D "$CALCURSE_DIR" --export > "$temp_export" || die "Export failed"
+    local prepared_export
+    [[ ! -d "$destination" ]] || die "Export destination is a directory: $destination"
+    prepared_export=$(mktemp "${destination}.XXXXXX") || die "Unable to stage Calcurse export"
+    SYNC_TEMP_FILES+=("$prepared_export")
 
     # Leggi notification.warning dalla configurazione Calcurse
     local notification_warning=""
@@ -1344,81 +1459,156 @@ export_calcurse_with_uids() {
 
     local in_event=0
     local event_block=""
-    while IFS= read -r line; do
-        if [[ "$line" == "BEGIN:VEVENT" ]]; then
-            event_block="$line"
-            in_event=1
-        elif [[ "$line" == "END:VEVENT" ]]; then
-            event_block+=$'\n'"$line"
+    if ! (
+        while IFS= read -r line; do
+            if [[ "$line" == "BEGIN:VEVENT" ]]; then
+                event_block="$line"
+                in_event=1
+            elif [[ "$line" == "END:VEVENT" ]]; then
+                event_block+=$'\n'"$line"
 
-            # Sostituisci -P300S con il valore configurato
-            event_block="${event_block//TRIGGER:-P300S/TRIGGER:-P${notification_warning}S}"
+                # Sostituisci -P300S con il valore configurato
+                event_block="${event_block//TRIGGER:-P300S/TRIGGER:-P${notification_warning}S}"
 
-            if [[ "$event_block" != *$'\nUID:'* ]]; then
-                local uid=$(generate_event_uid "$event_block" "calcurse")
-                event_block="${event_block/BEGIN:VEVENT/BEGIN:VEVENT$'\n'UID:$uid}"
+                if [[ "$event_block" != *$'\nUID:'* ]]; then
+                    local uid
+                    uid=$(generate_event_uid "$event_block" "calcurse") || exit 1
+                    event_block="${event_block/BEGIN:VEVENT/BEGIN:VEVENT$'\n'UID:$uid}"
+                fi
+                printf '%s\n' "$event_block" || exit 1
+                in_event=0
+                event_block=""
+            elif [[ $in_event -eq 1 ]]; then
+                event_block+=$'\n'"$line"
+            else
+                echo "$line" || exit 1
             fi
-            printf '%s\n' "$event_block"
-            in_event=0
-            event_block=""
-        elif [[ $in_event -eq 1 ]]; then
-            event_block+=$'\n'"$line"
-        else
-            echo "$line"
-        fi
-    done < "$temp_export" > "$destination"
+        done < "$temp_export"
+    ) > "$prepared_export"; then
+        rm -f "$temp_export" "$prepared_export"
+        die "Unable to write Calcurse export"
+    fi
 
     rm -f "$temp_export"
-    [[ -s "$destination" ]]
+    if ! mv -Tf -- "$prepared_export" "$destination"; then
+        rm -f "$prepared_export"
+        die "Unable to publish Calcurse export"
+    fi
+}
+
+stage_proton_export() {
+    local -n export_keys="$1" export_blocks="$2" export_uids="$3"
+    [[ ! -d "$NEW_EVENTS_FILE" ]] || {
+        warn "Proton export destination is a directory: $NEW_EVENTS_FILE"
+        return 1
+    }
+    STAGED_PROTON_EXPORT=$(mktemp "$BACKUP_DIR/.proton-export.XXXXXX") || return 1
+    if ! (
+        printf '%s\n' BEGIN:VCALENDAR VERSION:2.0 'PRODID:-//calcurse-sync//Export to Proton//' || exit 1
+        local key block line updated
+        for key in "${export_keys[@]}"; do
+            block="${export_blocks[$key]}"
+            if [[ -n "${export_uids[$key]}" ]]; then
+                updated=""
+                while IFS= read -r line; do
+                    [[ "$line" != UID:* ]] || line="UID:${export_uids[$key]}"
+                    updated+="$line"$'\n'
+                done <<< "$block"
+                block="${updated%$'\n'}"
+            fi
+            block=$(enrich_event_for_proton "$block") || exit 1
+            block=$(add_bnb_color "$block") || exit 1
+            block=$(clean_event_rrules_for_proton "$block") || exit 1
+            check_proton_export_rule "$block" || exit 1
+            block=$(normalize_alarms "$block" proton) || exit 1
+            printf '%s\n' "$block" || exit 1
+        done
+        printf '%s\n' END:VCALENDAR || exit 1
+    ) > "$STAGED_PROTON_EXPORT"; then
+        return 1
+    fi
+    extract_vevents_unfolded "$STAGED_PROTON_EXPORT" >/dev/null
 }
 
 # ----------------------------------------------------------------------
 # FUNZIONE DI NORMALIZZAZIONE RRULE
 # ----------------------------------------------------------------------
+sort_unique_values() {
+    local -n sorted_values="$1"
+    local -a sorted_result=()
+    local item i
+    # RRULE lists are short; insertion sort avoids spawning sort for each event.
+    for item in "${sorted_values[@]}"; do
+        i=${#sorted_result[@]}
+        while (( i > 0 )) && [[ "${sorted_result[i-1]}" > "$item" ]]; do
+            sorted_result[i]="${sorted_result[i-1]}"
+            ((i--))
+        done
+        sorted_result[i]="$item"
+    done
+    sorted_values=()
+    local previous="" have_previous=0
+    for item in "${sorted_result[@]}"; do
+        if [[ $have_previous -eq 0 || "$item" != "$previous" ]]; then
+            sorted_values+=("$item")
+        fi
+        previous="$item"
+        have_previous=1
+    done
+}
+
 normalize_rrule_for_comparison() {
     local rrule="$1"
-
-    # Se vuoto, ritorna vuoto
-    [[ -z "$rrule" ]] && return
-
-    # Estrai i componenti e ordina alfabeticamente
-    local freq="" byday="" bymonthday="" bymonth="" until="" interval="" count="" wkst=""
-
+    local dtstart="${2:-}" component value
+    local -a components normalized=() values
+    [[ -z "$rrule" ]] && return 0
     IFS=';' read -ra components <<< "$rrule"
     for component in "${components[@]}"; do
         case "$component" in
-            FREQ=*) freq="$component" ;;
-            BYDAY=*) byday="$component" ;;
-            BYMONTHDAY=*) bymonthday="$component" ;;
-            BYMONTH=*) : ;; # Ignorato per compatibilita tra Calcurse e Proton
+            INTERVAL=1|WKST=MO) continue ;;
+            BY*=*)
+                IFS=',' read -ra values <<< "${component#*=}"
+                sort_unique_values values
+                printf -v value '%s,' "${values[@]}"
+                value="${value%,}"
+                component="${component%%=*}=$value"
+                ;;
             UNTIL=*)
-                if [[ "$component" =~ ^UNTIL=[0-9]{8}T[0-9]{6}Z?$ ]]; then
-                    until="UNTIL=NORM"
-                else
-                    until="$component"
+                value="${component#*=}"
+                if [[ "$value" == *T* ]]; then
+                    ics_datetime_to_local "UNTIL:$value" value || return 1
+                    if [[ "$dtstart" == *T* && "${value:9:6}" < "${dtstart:9:6}" ]]; then
+                        value=$(TZ=UTC date -d "${value:0:4}-${value:4:2}-${value:6:2} -1 day" +%Y%m%d) || return 1
+                    fi
+                    component="UNTIL=${value:0:8}"
                 fi
                 ;;
-            INTERVAL=*) interval="$component" ;;
-            COUNT=*) count="$component" ;;
-            WKST=*) wkst="$component" ;;
         esac
+        normalized+=("$component")
     done
+    sort_unique_values normalized
+    local IFS=';'
+    echo "${normalized[*]}"
+}
 
-    # Ricostruisci in ordine standard: FREQ, INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH
-    local normalized=""
-    [[ -n "$freq" ]] && normalized="${normalized}${freq};"
-    [[ -n "$interval" ]] && normalized="${normalized}${interval};"
-    [[ -n "$count" ]] && normalized="${normalized}${count};"
-    [[ -n "$until" ]] && normalized="${normalized}${until};"
-    [[ -n "$byday" ]] && normalized="${normalized}${byday};"
-    [[ -n "$bymonthday" ]] && normalized="${normalized}${bymonthday};"
-    [[ -n "$bymonth" ]] && normalized="${normalized}${bymonth};"
-    [[ -n "$wkst" ]] && normalized="${normalized}${wkst};"
-
-    # Rimuovi ultimo ";"
-    normalized="${normalized%;}"
-
-    echo "$normalized"
+event_comparison_rrule() {
+    local block="$1" line dtstart="" rrule=""
+    while IFS= read -r line; do
+        case "$line" in
+            DTSTART*) dtstart="${line#*:}"
+                [[ "$dtstart" != *T* ]] || ics_datetime_to_local "$line" dtstart || return 1 ;;
+            RRULE:*) rrule="${line#RRULE:}" ;;
+        esac
+    done <<< "$block"
+    [[ -n "$rrule" ]] || return 0
+    rrule=$(clean_rrule_for_proton "$rrule" "DTSTART:$dtstart") || return 1
+    if [[ "$rrule" == *FREQ=WEEKLY* && "$rrule" != *BYDAY=* ]]; then
+        local weekday
+        weekday=$(LC_ALL=C date -d "${dtstart:0:4}-${dtstart:4:2}-${dtstart:6:2}" +%u) || return 1
+        local -a days=(MO TU WE TH FR SA SU)
+        rrule+=";BYDAY=${days[weekday-1]}"
+    fi
+    normalize_rrule_for_comparison "$rrule" "$dtstart"
 }
 
 # ----------------------------------------------------------------------
@@ -1426,7 +1616,7 @@ normalize_rrule_for_comparison() {
 # ----------------------------------------------------------------------
 compute_event_hash() {
     local event_block="$1"
-    local dtstart="" dtend="" summary="" description="" duration=""
+    local dtstart="" dtend="" summary="" description="" duration="" location=""
     local in_alarm=0 line
 
     while IFS= read -r line; do
@@ -1438,31 +1628,40 @@ compute_event_hash() {
 
         [[ $in_alarm -eq 1 ]] && continue
         case "$line" in
-            DTSTART*) [[ -z "$dtstart" ]] && dtstart="${line#*:}" ;;
-            DTEND*) [[ -z "$dtend" ]] && dtend="${line#*:}" ;;
+            DTSTART*)
+                if [[ -z "$dtstart" ]]; then
+                    dtstart="${line#*:}"
+                    [[ "$dtstart" != *T* ]] || ics_datetime_to_local "$line" dtstart || return 1
+                fi
+                ;;
+            DTEND*)
+                if [[ -z "$dtend" ]]; then
+                    dtend="${line#*:}"
+                    [[ "$dtend" != *T* ]] || ics_datetime_to_local "$line" dtend || return 1
+                fi
+                ;;
             SUMMARY:*) [[ -z "$summary" ]] && summary="${line#SUMMARY:}" ;;
             DESCRIPTION:*) [[ -z "$description" ]] && description="${line#DESCRIPTION:}" ;;
+            LOCATION:*) location="${line#LOCATION:}" ;;
             DURATION:*) [[ -z "$duration" ]] && duration="${line#DURATION:}" ;;
         esac
     done <<< "$event_block"
 
-    dtstart=$(_norm_dt_token_for_hash "$dtstart")
-    dtend=$(_norm_dt_token_for_hash "$dtend")
+    dtstart="${dtstart//[[:space:]]/}"
+    dtend="${dtend//[[:space:]]/}"
 
     local duration_min=0
     if [[ -n "$duration" ]]; then
-        local days=0 hours=0 minutes=0
-        [[ $duration =~ P([0-9]+)D ]] && days=${BASH_REMATCH[1]}
-        [[ $duration =~ ([0-9]+)H ]] && hours=${BASH_REMATCH[1]}
-        [[ $duration =~ ([0-9]+)M ]] && minutes=${BASH_REMATCH[1]}
-        duration_min=$((days * 1440 + hours * 60 + minutes))
+        local seconds
+        ics_duration_seconds "$duration" seconds || return 1
+        duration_min=$((seconds / 60))
     elif [[ -n "$dtend" ]]; then
         if [[ "$dtstart" =~ ^[0-9]{8}$ && "$dtend" =~ ^[0-9]{8}$ ]]; then
             local s="${dtstart:0:4}-${dtstart:4:2}-${dtstart:6:2}"
             local e="${dtend:0:4}-${dtend:4:2}-${dtend:6:2}"
             local s_epoch e_epoch
-            s_epoch=$(date -d "$s" +%s 2>/dev/null || echo "")
-            e_epoch=$(date -d "$e" +%s 2>/dev/null || echo "")
+            s_epoch=$(TZ=UTC date -d "$s" +%s 2>/dev/null || echo "")
+            e_epoch=$(TZ=UTC date -d "$e" +%s 2>/dev/null || echo "")
             if [[ -n "$s_epoch" && -n "$e_epoch" ]]; then
                 local days_diff=$(( (e_epoch - s_epoch) / 86400 ))
                 [[ $days_diff -le 0 ]] && days_diff=1
@@ -1471,14 +1670,9 @@ compute_event_hash() {
                 duration_min=1440
             fi
         elif [[ "$dtstart" =~ ^[0-9]{8}T[0-9]{6}$ && "$dtend" =~ ^[0-9]{8}T[0-9]{6}$ ]]; then
-            local start_hour=${dtstart:9:2}
-            local start_min=${dtstart:11:2}
-            local end_hour=${dtend:9:2}
-            local end_min=${dtend:11:2}
-            local start_total=$((10#$start_hour * 60 + 10#$start_min))
-            local end_total=$((10#$end_hour * 60 + 10#$end_min))
-            duration_min=$((end_total - start_total))
-            [[ $duration_min -lt 0 ]] && duration_min=$((duration_min + 1440))
+            local seconds
+            ics_elapsed_seconds "$dtstart" "$dtend" seconds || return 1
+            duration_min=$((seconds / 60))
         else
             duration_min=30
         fi
@@ -1489,7 +1683,7 @@ compute_event_hash() {
     fi
 
     local hash
-    hash=$(printf '%s' "${dtstart}|${summary}|${description}|${duration_min}" | sha256sum)
+    hash=$(printf '%s' "${dtstart}|${summary}|${description}|${location}|${duration_min}" | sha256sum)
     hash="${hash%% *}"
     echo "${hash:0:16}"
 }
@@ -1531,7 +1725,11 @@ extract_exdates_normalized() {
         IFS=',' read -ra parts <<< "$payload"
         local p t
         for p in "${parts[@]}"; do
-            t=$(_norm_dt_token_common "$p")
+            if [[ "$p" == *T* ]]; then
+                ics_datetime_to_local "${line%%:*}:$p" t || return 1
+            else
+                t=$(_norm_dt_token_common "$p")
+            fi
             [[ -n "$t" ]] && acc+="${t}"$'\n'
         done
     done <<< "$event_block"
@@ -1871,6 +2069,7 @@ option_A() {
     local dry_run_export=""
     if [[ $DRY_RUN -eq 1 ]]; then
         dry_run_export=$(mktemp) || die "Unable to create temporary dry-run export"
+        SYNC_TEMP_FILES+=("$dry_run_export")
         comparison_export="$dry_run_export"
     fi
     export_calcurse_with_uids "$comparison_export"
@@ -1938,11 +2137,14 @@ option_A() {
 
    # echo "🔍 Analizzo le differenze tra i calendari..."
 
-    local proton_tmp=$(mktemp)
-    local calcurse_tmp=$(mktemp)
+    local proton_tmp calcurse_tmp
+    proton_tmp=$(mktemp) || die "Unable to create Proton comparison file"
+    SYNC_TEMP_FILES+=("$proton_tmp")
+    calcurse_tmp=$(mktemp) || die "Unable to create Calcurse comparison file"
+    SYNC_TEMP_FILES+=("$calcurse_tmp")
 
-    extract_vevents_unfolded "$IMPORT_FILE" > "$proton_tmp"
-    extract_vevents_unfolded "$comparison_export" > "$calcurse_tmp"
+    extract_vevents_unfolded "$IMPORT_FILE" > "$proton_tmp" || die "Invalid Proton calendar"
+    extract_vevents_unfolded "$comparison_export" > "$calcurse_tmp" || die "Invalid Calcurse export"
 
     # Indicizzazione Proton
     declare -A proton_events
@@ -1971,6 +2173,9 @@ option_A() {
             block+=$'\n'"$line"
 
             local key recurrence_sig
+            if [[ -n "$event_rrule" ]]; then
+                check_recurrence_timezone "$event_dtstart_line" || die "Unsupported recurrence timezone"
+            fi
             build_event_identity_from_metadata "$event_uid" "$event_dtstart" "$event_summary" "$event_rrule" key recurrence_sig
 
             proton_events["$key"]="${event_summary}||${event_uid}"
@@ -2060,15 +2265,27 @@ option_A() {
     declare -A proton_hashes_map
     declare -A calcurse_hash_by_key
     declare -A proton_hash_by_key
+    declare -A calcurse_comparison_rrules
+    declare -A proton_comparison_rrules
 
     for key in "${!calcurse_events[@]}"; do
-        local hash=$(compute_event_hash "${calcurse_blocks[$key]}")
+        local hash
+        hash=$(compute_event_hash "${calcurse_blocks[$key]}") || die "Cannot compare Calcurse event"
+        calcurse_comparison_rrules["$key"]=""
+        if [[ -n "${calcurse_recurrence_sig_by_key[$key]}" ]]; then
+            calcurse_comparison_rrules["$key"]=$(event_comparison_rrule "${calcurse_blocks[$key]}") || die "Cannot compare Calcurse recurrence"
+        fi
         calcurse_hash_by_key["$key"]="$hash"
         calcurse_hashes_map["$hash"]="$key"
     done
 
     for key in "${!proton_events[@]}"; do
-        local hash=$(compute_event_hash "${proton_blocks[$key]}")
+        local hash
+        hash=$(compute_event_hash "${proton_blocks[$key]}") || die "Cannot compare Proton event"
+        proton_comparison_rrules["$key"]=""
+        if [[ -n "${proton_recurrence_sig_by_key[$key]}" ]]; then
+            proton_comparison_rrules["$key"]=$(event_comparison_rrule "${proton_blocks[$key]}") || die "Cannot compare Proton recurrence"
+        fi
         proton_hash_by_key["$key"]="$hash"
         proton_hashes_map["$hash"]="$key"
     done
@@ -2080,6 +2297,9 @@ option_A() {
     declare -a events_to_import_to_calcurse
     declare -a events_to_delete_from_calcurse
     declare -a events_to_export_to_proton
+    declare -A proton_export_uids
+    declare -A content_conflicts
+    declare -A matched_calcurse_keys
     local unresolved_difference_count=0
     # ============================================================
     # EXDATE: gestisci le eccezioni sulle ricorrenze (cancellazione singola occorrenza)
@@ -2120,7 +2340,10 @@ option_A() {
             [[ -n "${calcurse_hashes_map[$proton_hash]}" ]] && ckey="${calcurse_hashes_map[$proton_hash]}"
         fi
 
-        [[ -n "$ckey" ]] && proton_to_calcurse["$pkey"]="$ckey"
+        if [[ -n "$ckey" ]]; then
+            proton_to_calcurse["$pkey"]="$ckey"
+            matched_calcurse_keys["$ckey"]=1
+        fi
     done
 
     declare -A previous_alarm_state
@@ -2162,6 +2385,48 @@ option_A() {
         next_event_state["${proton_alarm_state_key_by_key[$pkey]}"]=1
     done
 
+    for pkey in "${!proton_to_calcurse[@]}"; do
+        local ckey="${proton_to_calcurse[$pkey]}"
+        if [[ "${proton_hash_by_key[$pkey]}" == "${calcurse_hash_by_key[$ckey]}" &&
+              "${proton_comparison_rrules[$pkey]}" == "${calcurse_comparison_rrules[$ckey]}" ]]; then
+            continue
+        fi
+        content_conflicts["$ckey"]=1
+        echo ""
+        echo "Matching events have different content:"
+        local side comparison_block comparison_line
+        for side in Proton Calcurse; do
+            echo "   $side:"
+            if [[ "$side" == Proton ]]; then
+                comparison_block="${proton_blocks[$pkey]}"
+            else
+                comparison_block="${calcurse_blocks[$ckey]}"
+            fi
+            while IFS= read -r comparison_line; do
+                case "$comparison_line" in
+                    SUMMARY:*|DTSTART*|DTEND*|DURATION:*|RRULE:*|LOCATION:*|DESCRIPTION:*)
+                        printf '      %s\n' "$comparison_line" ;;
+                esac
+            done <<< "$comparison_block"
+        done
+        echo "   P) Use Proton version (replace the Calcurse event)"
+        echo "   C) Use Calcurse version (export an update for Proton)"
+        echo "   S) Postpone and ask again next time"
+        local content_choice
+        read -rp "   Choice (P/C/S): " content_choice
+        case "${content_choice^^}" in
+            P)
+                events_to_delete_from_calcurse+=("$ckey")
+                events_to_import_to_calcurse+=("$pkey")
+                ;;
+            C)
+                events_to_export_to_proton+=("$ckey")
+                proton_export_uids["$ckey"]="${proton_uid_by_key[$pkey]}"
+                ;;
+            *) ((unresolved_difference_count++)) ;;
+        esac
+    done
+
     for pkey in "${!proton_events[@]}"; do
         local pblock="${proton_blocks[$pkey]}"
         local psig="${proton_recurrence_sig_by_key[$pkey]}"
@@ -2171,10 +2436,11 @@ option_A() {
         puid="${proton_uid_by_key[$pkey]}"
         local ckey="${proton_to_calcurse[$pkey]}"
         [[ -z "$ckey" ]] && continue
+        [[ -n "${content_conflicts[$ckey]}" ]] && continue
 
         local pex cex
-        pex=$(extract_exdates_normalized "$pblock")
-        cex=$(extract_exdates_normalized "${calcurse_blocks[$ckey]}")
+        pex=$(extract_exdates_normalized "$pblock") || die "Invalid Proton EXDATE"
+        cex=$(extract_exdates_normalized "${calcurse_blocks[$ckey]}") || die "Invalid Calcurse EXDATE"
         # --- FIX: Normalize both to pure dates (YYYYMMDD) for comparison ---
         # Remove T000000 (and any trailing garbage) to compare just the dates
         # This prevents false conflicts like "20251230" vs "20251230T000000"
@@ -2265,6 +2531,7 @@ option_A() {
                 C)
                     # Esporta la versione Calcurse verso Proton (import manuale)
                     events_to_export_to_proton+=("$ckey")
+                    proton_export_uids["$ckey"]="$proton_uid"
                     echo "   ✅ Will update Proton with Calcurse's exclusions"
                     ;;
                 *)
@@ -2284,7 +2551,7 @@ option_A() {
         local found_in_calcurse=0
 
         # Check 1: Confronto diretto per chiave
-        if [[ -n "${calcurse_events[$key]}" ]]; then
+        if [[ -n "${proton_to_calcurse[$key]}" || -n "${calcurse_events[$key]}" ]]; then
             found_in_calcurse=1
         else
             # Check 2: Cerca per UID (se chiave basata su UID o nel blocco)
@@ -2379,7 +2646,7 @@ option_A() {
         local found_in_proton=0
 
         # Check 1: Confronto diretto
-        if [[ -n "${proton_events[$key]}" ]]; then
+        if [[ -n "${matched_calcurse_keys[$key]}" || -n "${proton_events[$key]}" ]]; then
             found_in_proton=1
         else
             # Check 2: Cerca per UID
@@ -2482,6 +2749,7 @@ option_A() {
 
             local ckey="${proton_to_calcurse[$pkey]}"
             [[ -n "$ckey" ]] || continue
+            [[ -z "${content_conflicts[$ckey]}" ]] || continue
             [[ -z "${scheduled_calcurse_deletions[$ckey]}" ]] || continue
             [[ -z "${scheduled_proton_imports[$pkey]}" ]] || continue
 
@@ -2544,6 +2812,7 @@ option_A() {
         local ckey="${proton_to_calcurse[$pkey]}"
 
         [[ -n "$ckey" ]] || continue
+        [[ -z "${content_conflicts[$ckey]}" ]] || continue
         [[ -z "${scheduled_calcurse_deletions[$ckey]}" ]] || continue
         [[ -z "${scheduled_proton_imports[$pkey]}" ]] || continue
 
@@ -2628,9 +2897,13 @@ option_A() {
         else
             if ! save_alarm_state proton_blocks alarm_state_overrides proton_alarm_state_key_by_key; then
                 warn "The alarm state could not be updated."
+                rm -f "$proton_tmp" "$calcurse_tmp" "$dry_run_export"
+                return 1
             fi
             if ! save_event_state next_event_state; then
                 warn "The event state could not be updated."
+                rm -f "$proton_tmp" "$calcurse_tmp" "$dry_run_export"
+                return 1
             fi
         fi
         rm -f "$proton_tmp" "$calcurse_tmp" "$dry_run_export"
@@ -2695,6 +2968,11 @@ option_A() {
         return 1
     fi
 
+    if [[ ${#events_to_export_to_proton[@]} -gt 0 ]]; then
+        stage_proton_export events_to_export_to_proton calcurse_blocks proton_export_uids ||
+            die "Unable to prepare Proton export; Calcurse and synchronization state were not changed"
+    fi
+
     # Backup prima delle modifiche
     echo ""
     echo "💾 Creating backup..."
@@ -2721,10 +2999,9 @@ option_A() {
 
         local target_calendar
         target_calendar=$(mktemp) || die "Unable to create temporary target calendar"
+        SYNC_TEMP_FILES+=("$target_calendar")
 
-        echo "BEGIN:VCALENDAR" > "$target_calendar"
-        echo "VERSION:2.0" >> "$target_calendar"
-        echo "PRODID:-//calcurse-sync//Atomic target//" >> "$target_calendar"
+        printf '%s\n' BEGIN:VCALENDAR VERSION:2.0 'PRODID:-//calcurse-sync//Atomic target//' > "$target_calendar" || die "Unable to write target calendar"
 
         block=""
         in_event=0
@@ -2755,7 +3032,7 @@ option_A() {
                         block=$(remove_alarms_from_event "$block")
                         ((removed_notification_count++))
                     fi
-                    printf '%s\n' "$block" >> "$target_calendar"
+                    printf '%s\n' "$block" >> "$target_calendar" || die "Unable to write target calendar"
                     ((kept_count++))
                 else
                     ((deleted_count++))
@@ -2769,11 +3046,11 @@ option_A() {
         done < "$calcurse_tmp"
 
         for key in "${!to_import[@]}"; do
-            printf '%s\n' "${proton_blocks[$key]}" >> "$target_calendar"
+            printf '%s\n' "${proton_blocks[$key]}" >> "$target_calendar" || die "Unable to write target calendar"
             ((imported_count++))
         done
 
-        echo "END:VCALENDAR" >> "$target_calendar"
+        echo "END:VCALENDAR" >> "$target_calendar" || die "Unable to write target calendar"
 
         echo "Processing summary:"
         echo "  - Existing events processed: $event_count"
@@ -2796,30 +3073,8 @@ option_A() {
         echo ""
         echo "📤 Generating file for import into Proton..."
 
-        echo "BEGIN:VCALENDAR" > "$NEW_EVENTS_FILE"
-        echo "VERSION:2.0" >> "$NEW_EVENTS_FILE"
-        echo "PRODID:-//calcurse-sync//Export to Proton//" >> "$NEW_EVENTS_FILE"
-
-        for key in "${events_to_export_to_proton[@]}"; do
-            local event_block="${calcurse_blocks[$key]}"
-
-            # Arricchisci per Proton
-            event_block=$(enrich_event_for_proton "$event_block")
-            # Aggiungi COLOR per BnB
-            event_block=$(add_bnb_color "$event_block")
-
-            # Pulisci RRULE usando anche il contesto DTSTART/TZID.
-            local cleaned_block
-            cleaned_block=$(clean_event_rrules_for_proton "$event_block")
-
-            local normalized=$(normalize_alarms "$cleaned_block" "proton")
-            normalized=$(echo "$normalized" | sed 's/BEGIN:VALARMTRIGGER/BEGIN:VALARM\nTRIGGER/g')
-            normalized=$(echo "$normalized" | sed 's/BEGIN:VALARMACTION/BEGIN:VALARM\nACTION/g')
-            echo "$normalized" >> "$NEW_EVENTS_FILE"
-        done
-
-        echo "END:VCALENDAR" >> "$NEW_EVENTS_FILE"
-        sed -i '/^$/d' "$NEW_EVENTS_FILE"
+        mv -Tf -- "$STAGED_PROTON_EXPORT" "$NEW_EVENTS_FILE" || die "Unable to publish Proton export; synchronization state was not updated"
+        STAGED_PROTON_EXPORT=""
 
         echo "✅ File generated: $NEW_EVENTS_FILE"
         echo "   📌 Please manually import this file into  Proton Calendar"
@@ -2837,9 +3092,13 @@ option_A() {
 
     if ! save_alarm_state proton_blocks alarm_state_overrides proton_alarm_state_key_by_key; then
         warn "Synchronization succeeded, but the alarm state could not be updated."
+        rm -f "$proton_tmp" "$calcurse_tmp"
+        return 1
     fi
     if ! save_event_state next_event_state; then
         warn "Synchronization succeeded, but the event state could not be updated."
+        rm -f "$proton_tmp" "$calcurse_tmp"
+        return 1
     fi
 
     # Pulizia
@@ -3232,14 +3491,14 @@ while true; do
     read -rp "Enter A, B or Q: " choice
 
     case "${choice^^}" in
-        A) option_A; break ;;
+        A) option_A; exit $? ;;
         B|F)
             if [[ $DRY_RUN -eq 1 ]]; then
                 echo "❌ Complete sync is unavailable in dry-run mode. Choose A or Q."
                 continue
             fi
             option_F
-            break
+            exit $?
             ;;  # 'F' kept as a legacy alias
         Q) echo "👋 Goodbye!"; exit 0 ;;
         *) echo "❌ Error: Invalid choice. Use A, B or Q." ;;

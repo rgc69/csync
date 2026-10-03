@@ -98,6 +98,16 @@ Before replacing Calcurse appointments, the script imports and validates the
 complete target calendar in a temporary Calcurse database. The real `apts`
 file is replaced only after a successful import with the expected event count.
 Failed imports leave the existing appointments and TODO items unchanged.
+The original ICS envelope and component nesting are checked before import.
+An empty or malformed file is rejected; a valid empty calendar can still be
+used for complete sync after confirmation. Duplicate event UIDs, `RDATE`, and
+detached occurrences using `RECURRENCE-ID` are rejected explicitly because they
+cannot currently be represented safely by this synchronization flow.
+
+Proton exports are prepared and checked before applying the selected Calcurse
+changes, then published with an atomic file replacement. A preparation failure
+preserves Calcurse, the previous export, and synchronization state. Write and
+state-save failures return a nonzero exit status instead of reporting success.
 
 ### Integration Tests
 
@@ -109,7 +119,9 @@ bash tests/run.sh
 
 The suite requires `calcurse` and creates a separate temporary home and data
 directory for every scenario. It never reads or modifies the user's Calcurse
-database. Set `KEEP_TEST_TMP=1` to retain the temporary files after a run.
+database or synchronization state, including when `XDG_STATE_HOME` is set in
+the calling environment. Tests use `Europe/Rome` explicitly. Set
+`KEEP_TEST_TMP=1` to retain the temporary files after a run.
 
 Covered flows include guided import and export, second-pass idempotence,
 folded ICS properties with CRLF input, daily, weekly, monthly, and yearly
@@ -119,14 +131,19 @@ decisions, deletion detection for events originating in either Proton or
 Calcurse, recurring alarm removal without `RRULE`/`EXDATE` loss, dry-run
 preservation, unsupported alarm filters, and atomic failure preservation for
 appointments and TODO items.
+Additional regressions cover malformed and empty calendars, detached
+occurrences, UTC and foreign-timezone appointments, UTC exclusions, overnight
+and multi-day durations, DST transitions, changed event content and recurrence
+rules, cancellation, export failures, and inherited state-directory isolation.
 
 ### ICS Parsing
 
 Before comparison, physical ICS lines are unfolded into complete logical
 properties and trailing CR characters are removed. This is performed in one
-linear `awk` pass while extracting `VEVENT` blocks, replacing the previous
-`awk | tr` pipeline. Strict parser validation remains in the integration suite
-and is not run during normal synchronization.
+linear `awk` pass while extracting `VEVENT` blocks. That pass also checks the
+calendar envelope and balanced components and rejects unsupported detached
+occurrences. It is a lightweight structural check, not a complete RFC validator.
+The optional external parser remains confined to the integration suite.
 
 ### Event Normalization
 
@@ -140,9 +157,27 @@ Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
 ```
 
 **Comparison data:**
-1. Normalized content hash, excluding alarms and `EXDATE`
-2. Summary and UID for matching and display
-3. `EXDATE` and compatible display-alarm presence handled separately
+1. UID and normalized content are used to identify potential matches.
+2. Matched events are also compared for content and normalized recurrence rules;
+   matching UIDs alone do not imply equal events. Recurrence end dates and
+   meaningful filters are retained in this comparison.
+3. Content conflicts offer `P` (use Proton), `C` (export the Calcurse version),
+   or `S` (postpone). Postponed differences prevent the synchronized message.
+   Exports updating an existing Proton event retain its Proton UID.
+4. `EXDATE` and compatible display-alarm presence are handled separately when
+   there is no content conflict requiring a choice of the complete event.
+
+### Timezones and Durations
+
+- Single appointments expressed in UTC or a known IANA timezone are converted
+  to the local synchronization timezone. `DTEND`, `EXDATE`, and UTC `UNTIL` are
+  converted consistently. All-day dates remain dates.
+- The synchronization timezone is `${TZ:-Europe/Rome}` and is also passed to
+  Calcurse. Recurring events whose `DTSTART` uses another timezone are currently
+  rejected: differing daylight-saving transitions prevent a general conversion
+  to Calcurse's local recurrence representation.
+- Exported end times account for date rollover, multi-day durations, and
+  daylight-saving transitions.
 
 ### Proton Recurrence Compatibility
 
@@ -152,10 +187,16 @@ Both:     BYDAY=TH,TU;FREQ=WEEKLY;UNTIL=20251020
   `FREQ=WEEKLY`.
 - Date-time `UNTIL` values are converted from the event's `TZID` to UTC and
   written with the required trailing `Z`.
+- `DAILY` with plain `BYDAY`, interval one, and no additional date filters is
+  also converted to the equivalent weekly rule.
+- Filters such as `BYMONTH` and `BYSETPOS` are never dropped simply to make a
+  rule importable. If a rule cannot be normalized safely to a supported export
+  form, the export is stopped with the offending rule displayed. This includes
+  `DAILY` with `BYDAY` and an interval greater than one.
 
 ### Proton Recurrence Test Constraints
 
-The recurrence fixtures use Proton's documented
+The daily/weekly/monthly/yearly `EXDATE` fixtures use Proton's documented
 [daily, weekly, monthly, and yearly frequencies](https://proton.me/support/protoncalendar-create-update-and-delete-recurring-events).
 Their dates stay between 2030 and 2033 and every series has fewer than 49
 occurrences, within Proton Calendar's current
@@ -163,6 +204,9 @@ occurrences, within Proton Calendar's current
 and custom recurrence limits. Timed `EXDATE` values are exported with the same
 `TZID` as `DTSTART`, date-time `UNTIL` values are emitted in UTC, and simple
 monthly/yearly rules match the forms found in Proton's own exports.
+Compatibility is checked locally against the generated ICS; the suite does
+not access Proton accounts or perform live imports. Fixtures for unsupported
+forms verify explicit rejection rather than successful export.
 
 ### Event Deletion Detection
 

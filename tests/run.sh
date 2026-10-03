@@ -47,6 +47,8 @@ seed_calcurse() {
     HOME="$test_home" \
     XDG_DATA_HOME="$test_home/.local/share" \
     XDG_CONFIG_HOME="$test_home/.config" \
+    XDG_STATE_HOME="$test_home/.local/state" \
+    TZ=Europe/Rome \
     "$CALCURSE_BIN" -D "$calcurse_dir" -i "$FIXTURES/$fixture" \
         > "$case_dir/seed.log" 2>&1
 }
@@ -63,6 +65,8 @@ run_sync() {
         env HOME="$test_home" \
             XDG_DATA_HOME="$test_home/.local/share" \
             XDG_CONFIG_HOME="$test_home/.config" \
+            XDG_STATE_HOME="$test_home/.local/state" \
+            TZ=Europe/Rome \
             LC_ALL=C \
             bash "$SCRIPT" "$@" > "$output_file" 2>&1
     sync_status=${PIPESTATUS[1]}
@@ -73,6 +77,8 @@ export_raw_calcurse() {
     HOME="$test_home" \
     XDG_DATA_HOME="$test_home/.local/share" \
     XDG_CONFIG_HOME="$test_home/.config" \
+    XDG_STATE_HOME="$test_home/.local/state" \
+    TZ=Europe/Rome \
     "$CALCURSE_BIN" -D "$calcurse_dir" --export > "$destination"
 }
 
@@ -689,6 +695,273 @@ test_atomic_failure_preserves_data() {
     assert_line_count 1 "BEGIN:VTODO" "$raw_export" || return 1
 }
 
+test_invalid_calendar_rejection() {
+    local scenario mode before todo_before state_before
+    for scenario in empty text truncated override duplicate; do
+        for mode in A B; do
+            begin_case "invalid_${scenario}_${mode}"
+            seed_calcurse atomic-seed.ics || return 1
+            mkdir -p "$test_home/.local/state/calcurse-sync"
+            printf 'calcurse-sync-event-state\t1\n' > "$test_home/.local/state/calcurse-sync/event-state.tsv"
+            local input="$backup_dir/My Calendar-test.ics"
+            case "$scenario" in
+                empty) : > "$input" ;;
+                text) printf 'This is not a calendar\n' > "$input" ;;
+                truncated) sed '/^END:VCALENDAR/d' "$FIXTURES/proton-new.ics" > "$input" ;;
+                override) cp "$FIXTURES/unsupported-override.ics" "$input" ;;
+                duplicate) sed '/^RECURRENCE-ID/d' "$FIXTURES/unsupported-override.ics" > "$input" ;;
+            esac
+            before=$(sha256sum "$calcurse_dir/apts")
+            todo_before=$(sha256sum "$calcurse_dir/todo")
+            state_before=$(sha256sum "$test_home/.local/state/calcurse-sync/event-state.tsv")
+            run_sync "$mode"$'\nCONFIRM\n'
+            [[ "$sync_status" -ne 0 ]] || return 1
+            assert_contains "$output_file" "Proton calendar validation failed" || return 1
+            [[ "$before" == "$(sha256sum "$calcurse_dir/apts")" ]] || return 1
+            [[ "$todo_before" == "$(sha256sum "$calcurse_dir/todo")" ]] || return 1
+            [[ "$state_before" == "$(sha256sum "$test_home/.local/state/calcurse-sync/event-state.tsv")" ]] || return 1
+            [[ -f "$input" ]] || return 1
+        done
+    done
+}
+
+test_valid_empty_complete_import() {
+    begin_case valid_empty_complete
+    seed_calcurse atomic-seed.ics || return 1
+    install_proton_fixture empty.ics
+    local todo_before
+    todo_before=$(sha256sum "$calcurse_dir/todo")
+    run_sync $'B\nCONFIRM\n'
+    assert_status 0 || return 1
+    [[ ! -s "$calcurse_dir/apts" ]] || return 1
+    [[ "$todo_before" == "$(sha256sum "$calcurse_dir/todo")" ]] || return 1
+}
+
+test_timezone_import_and_comparison() {
+    begin_case timezone_import
+    install_proton_fixture timezone-proton.ics
+    run_sync $'A\ny\ny\ny\ny\ny\n'
+    assert_status 0 || return 1
+    local export_file="$backup_dir/calendario.ics"
+    assert_line_count 4 BEGIN:VEVENT "$export_file" || return 1
+    event_has_line "$export_file" 'Summer UTC' DTSTART:20300701T200000 || return 1
+    event_has_line "$export_file" 'Winter UTC' DTSTART:20300101T190000 || return 1
+    event_has_line "$export_file" 'Overnight UTC' DTSTART:20300702T010000 || return 1
+    event_has_line "$export_file" 'Foreign Zone' DTSTART:20300102T180000 || return 1
+    install_proton_fixture timezone-proton.ics
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" 'No changes to apply. The calendars are synchronized!' || return 1
+
+    begin_case timezone_different_instants
+    seed_calcurse proton-new-no-alarm.ics || return 1
+    sed -E '/^DT(START|END):/s/$/Z/' "$FIXTURES/proton-new-no-alarm.ics" > "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\nn\nC\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" '2 unresolved difference(s)' || return 1
+    assert_not_contains "$output_file" 'No changes to apply. The calendars are synchronized!' || return 1
+}
+
+test_utc_exdates_and_until() {
+    begin_case utc_exdates
+    sed -e 's/EXDATE;TZID=Europe\/Rome:/EXDATE:/g' \
+        -e '/^EXDATE/s/T200000/T180000Z/g' \
+        "$FIXTURES/palestra-proton-no-fridays.ics" > "$backup_dir/My Calendar-test.ics"
+    cp "$backup_dir/My Calendar-test.ics" "$case_dir/proton.ics"
+    run_sync $'A\ny\ny\n'
+    assert_status 0 || return 1
+    assert_contains "$backup_dir/calendario.ics" 'EXDATE:20300906T200000,20300913T200000,20300920T200000,20300927T200000' || return 1
+    assert_contains "$backup_dir/calendario.ics" 'UNTIL=20300930T200000' || return 1
+    cp "$case_dir/proton.ics" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" 'No changes to apply. The calendars are synchronized!' || return 1
+}
+
+test_foreign_recurrence_rejection() {
+    local mode before
+    for mode in A B; do
+        begin_case "foreign_recurrence_$mode"
+        seed_calcurse atomic-seed.ics || return 1
+        sed 's/TZID=Europe\/Rome/TZID=America\/New_York/g' \
+            "$FIXTURES/palestra-proton-no-fridays.ics" > "$backup_dir/My Calendar-test.ics"
+        before=$(sha256sum "$calcurse_dir/apts")
+        run_sync "$mode"$'\nCONFIRM\n'
+        [[ "$sync_status" -ne 0 ]] || return 1
+        assert_contains "$output_file" 'cannot be safely converted' || return 1
+        [[ "$before" == "$(sha256sum "$calcurse_dir/apts")" ]] || return 1
+    done
+}
+
+test_overnight_export() {
+    begin_case overnight_export
+    seed_calcurse overnight-calcurse.ics || return 1
+    install_proton_fixture empty.ics
+    run_sync $'A\nB\nB\nB\ny\n'
+    assert_status 0 || return 1
+    local export_file="$backup_dir/nuovi-appuntamenti-calcurse.ics"
+    event_has_line "$export_file" Midnight 'DTEND;TZID=Europe/Rome:20300108T010000' || return 1
+    event_has_line "$export_file" 'Multiple Days' 'DTEND;TZID=Europe/Rome:20300108T120000' || return 1
+    event_has_line "$export_file" 'DST Duration' 'DTEND;TZID=Europe/Rome:20270328T040000' || return 1
+    cp "$export_file" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" 'No changes to apply. The calendars are synchronized!' || return 1
+}
+
+test_content_conflict_decisions() {
+    begin_case content_conflict
+    seed_calcurse calcurse-new.ics || return 1
+    install_proton_fixture empty.ics
+    run_sync $'A\nB\ny\n'
+    assert_status 0 || return 1
+    local changed="$case_dir/changed.ics" before state_before
+    sed 's/^SUMMARY:.*/SUMMARY:Changed title/' "$backup_dir/nuovi-appuntamenti-calcurse.ics" > "$changed"
+    before=$(sha256sum "$calcurse_dir/apts")
+    state_before=$(sha256sum "$test_home/.local/state/calcurse-sync/event-state.tsv")
+    cp "$changed" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\nS\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" 'Matching events have different content' || return 1
+    assert_contains "$output_file" '1 unresolved difference(s)' || return 1
+    cp "$changed" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\nP\n' --dry-run
+    assert_status 0 || return 1
+    [[ "$before" == "$(sha256sum "$calcurse_dir/apts")" ]] || return 1
+    [[ "$state_before" == "$(sha256sum "$test_home/.local/state/calcurse-sync/event-state.tsv")" ]] || return 1
+    run_sync $'A\nP\nn\n'
+    assert_status 1 || return 1
+    [[ "$before" == "$(sha256sum "$calcurse_dir/apts")" ]] || return 1
+    [[ "$state_before" == "$(sha256sum "$test_home/.local/state/calcurse-sync/event-state.tsv")" ]] || return 1
+    cp "$changed" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\nP\ny\n'
+    assert_status 0 || return 1
+    assert_line_count 1 BEGIN:VEVENT "$backup_dir/calendario.ics" || return 1
+    assert_contains "$backup_dir/calendario.ics" 'SUMMARY:Changed title' || return 1
+    cp "$changed" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" 'No changes to apply. The calendars are synchronized!' || return 1
+
+    begin_case content_time_change
+    seed_calcurse calcurse-new.ics || return 1
+    install_proton_fixture empty.ics
+    run_sync $'A\nB\ny\n'
+    assert_status 0 || return 1
+    sed -e '/^DTSTART/s/T140000/T160000/' -e '/^DTEND/s/T144500/T164500/' \
+        "$backup_dir/nuovi-appuntamenti-calcurse.ics" > "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\nP\ny\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" 'Matching events have different content' || return 1
+    assert_contains "$backup_dir/calendario.ics" 'DTSTART:20360111T160000' || return 1
+    assert_contains "$backup_dir/calendario.ics" 'DURATION:P0DT0H45M0S' || return 1
+    assert_line_count 1 BEGIN:VEVENT "$backup_dir/calendario.ics" || return 1
+}
+
+test_recurrence_conflicts_and_export_uid() {
+    local change
+    for change in weekdays until; do
+        begin_case "recurrence_conflict_$change"
+        seed_calcurse palestra-calcurse.ics || return 1
+        local source="$FIXTURES/palestra-calcurse.ics" changed="$case_dir/changed.ics"
+        if [[ "$change" == weekdays ]]; then
+            sed 's/BYDAY=MO,WE,FR/BYDAY=MO,WE/' "$source" > "$changed"
+        else
+            sed 's/UNTIL=20300930/UNTIL=20301031/' "$source" > "$changed"
+        fi
+        cp "$changed" "$backup_dir/My Calendar-test.ics"
+        run_sync $'A\nC\ny\n'
+        assert_status 0 || return 1
+        assert_contains "$output_file" 'Matching events have different content' || return 1
+        assert_contains "$backup_dir/nuovi-appuntamenti-calcurse.ics" 'UID:palestra@test' || return 1
+        assert_contains "$backup_dir/nuovi-appuntamenti-calcurse.ics" 'BYDAY=MO,WE,FR' || return 1
+        cp "$changed" "$backup_dir/My Calendar-test.ics"
+        run_sync $'A\nP\ny\n'
+        assert_status 0 || return 1
+        assert_line_count 1 BEGIN:VEVENT "$backup_dir/calendario.ics" || return 1
+        cp "$changed" "$backup_dir/My Calendar-test.ics"
+        run_sync $'A\n'
+        assert_status 0 || return 1
+        assert_contains "$output_file" 'No changes to apply. The calendars are synchronized!' || return 1
+    done
+}
+
+test_proton_export_failure_preserves_state() {
+    local failure before state_before export_before
+    for failure in directory unsupported_rule daily_interval; do
+        begin_case "export_failure_$failure"
+        if [[ "$failure" == directory ]]; then
+            seed_calcurse calcurse-new.ics || return 1
+            mkdir "$backup_dir/nuovi-appuntamenti-calcurse.ics"
+        else
+            if [[ "$failure" == daily_interval ]]; then
+                seed_calcurse daily-interval-two-calcurse.ics || return 1
+            else
+                seed_calcurse month-filter-calcurse.ics || return 1
+            fi
+            cp "$FIXTURES/empty.ics" "$backup_dir/nuovi-appuntamenti-calcurse.ics"
+            export_before=$(sha256sum "$backup_dir/nuovi-appuntamenti-calcurse.ics")
+        fi
+        install_proton_fixture empty.ics
+        mkdir -p "$test_home/.local/state/calcurse-sync"
+        printf 'calcurse-sync-event-state\t1\n' > "$test_home/.local/state/calcurse-sync/event-state.tsv"
+        state_before=$(sha256sum "$test_home/.local/state/calcurse-sync/event-state.tsv")
+        before=$(sha256sum "$calcurse_dir/apts")
+        run_sync $'A\nB\ny\n'
+        [[ "$sync_status" -ne 0 ]] || return 1
+        assert_contains "$output_file" 'Unable to prepare Proton export' || return 1
+        assert_not_contains "$output_file" 'File generated:' || return 1
+        [[ "$before" == "$(sha256sum "$calcurse_dir/apts")" ]] || return 1
+        [[ "$state_before" == "$(sha256sum "$test_home/.local/state/calcurse-sync/event-state.tsv")" ]] || return 1
+        if [[ "$failure" != directory ]]; then
+            assert_contains "$output_file" 'Cannot safely export this recurrence' || return 1
+            [[ "$export_before" == "$(sha256sum "$backup_dir/nuovi-appuntamenti-calcurse.ics")" ]] || return 1
+        fi
+        local staged=("$backup_dir"/.proton-export.*)
+        [[ ! -e "${staged[0]}" ]] || return 1
+    done
+}
+
+test_weekly_interval_two_export() {
+    begin_case weekly_interval_two
+    seed_calcurse weekly-interval-two-calcurse.ics || return 1
+    install_proton_fixture empty.ics
+    run_sync $'A\nB\ny\n'
+    assert_status 0 || return 1
+    local export_file="$backup_dir/nuovi-appuntamenti-calcurse.ics"
+    assert_contains "$export_file" 'FREQ=WEEKLY' || return 1
+    assert_contains "$export_file" 'INTERVAL=2' || return 1
+    assert_contains "$export_file" 'BYDAY=MO,WE,FR' || return 1
+    cp "$export_file" "$backup_dir/My Calendar-test.ics"
+    run_sync $'A\n'
+    assert_status 0 || return 1
+    assert_contains "$output_file" 'No changes to apply. The calendars are synchronized!' || return 1
+}
+
+test_state_failure_status() {
+    begin_case state_failure
+    seed_calcurse calcurse-new.ics || return 1
+    install_proton_fixture empty.ics
+    mkdir -p "$test_home/.local/state"
+    printf 'blocked\n' > "$test_home/.local/state/calcurse-sync"
+    run_sync $'A\nB\ny\n'
+    assert_status 1 || return 1
+    assert_contains "$output_file" 'alarm state could not be updated' || return 1
+    assert_not_contains "$output_file" 'command not found' || return 1
+    assert_not_contains "$output_file" 'SELECTED CHANGES COMPLETED' || return 1
+}
+
+test_inherited_state_isolation() {
+    begin_case inherited_state
+    install_proton_fixture proton-new.ics
+    local inherited="$case_dir/inherited-state"
+    mkdir "$inherited"
+    XDG_STATE_HOME="$inherited" run_sync $'A\ny\ny\n'
+    assert_status 0 || return 1
+    assert_state_value 1 || return 1
+    [[ ! -e "$inherited/calcurse-sync" ]] || return 1
+}
+
 run_test() {
     local description="$1"
     local test_function="$2"
@@ -731,6 +1004,18 @@ run_test "Proton-origin deletion detection" test_proton_origin_deletion_detectio
 run_test "Calcurse-origin deletion detection" test_calcurse_origin_deletion_detection
 run_test "Dry-run preserves files and Calcurse data" test_dry_run_preserves_everything
 run_test "Atomic failure preserves appointments/TODO" test_atomic_failure_preserves_data
+run_test "Malformed calendars and overrides rejected" test_invalid_calendar_rejection
+run_test "Valid empty complete import" test_valid_empty_complete_import
+run_test "UTC/TZID import and idempotence" test_timezone_import_and_comparison
+run_test "UTC EXDATE and UNTIL conversion" test_utc_exdates_and_until
+run_test "Foreign recurrence timezone rejection" test_foreign_recurrence_rejection
+run_test "Overnight, multi-day and DST export" test_overnight_export
+run_test "Content conflict choices and cancellation" test_content_conflict_decisions
+run_test "Recurrence changes and Proton UID reuse" test_recurrence_conflicts_and_export_uid
+run_test "Export failure preserves data and baseline" test_proton_export_failure_preserves_state
+run_test "Weekly INTERVAL=2 export and idempotence" test_weekly_interval_two_export
+run_test "State write failure exit status" test_state_failure_status
+run_test "Inherited XDG state isolation" test_inherited_state_isolation
 
 printf '\nResult: %s passed, %s failed (%ss)\n' \
     "$pass_count" "$fail_count" "$((SECONDS - suite_started))"
